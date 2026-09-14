@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "code-notepad"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "mime_guess",
  "percent-encoding",
