@@ -69,6 +69,41 @@ struct ProjectSourceFile {
     contents: String,
 }
 
+const SUPPORTED_FILE_EXTENSIONS: &[&str] = &[
+    "bash", "bat", "c", "cc", "cjs", "cmd", "cpp", "cs", "css", "cts", "cxx", "dart", "env", "go",
+    "h", "hpp", "htm", "html", "ini", "java", "js", "json", "jsonc", "jsx", "kt", "kts", "less",
+    "log", "lua", "markdown", "md", "mjs", "mts", "php", "phtml", "ps1", "py", "pyw", "rb", "rs",
+    "scss", "sh", "sql", "svelte", "swift", "toml", "ts", "tsx", "txt", "vue", "xml", "yaml",
+    "yml", "zsh",
+];
+
+fn is_supported_file_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .map(|extension| SUPPORTED_FILE_EXTENSIONS.contains(&extension.as_str()))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn get_launch_files() -> Vec<String> {
+    std::env::args_os()
+        .skip(1)
+        .filter_map(|argument| {
+            let path = PathBuf::from(argument);
+            if !path.is_file() || !is_supported_file_path(&path) {
+                return None;
+            }
+            Some(
+                fs::canonicalize(&path)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        })
+        .collect()
+}
+
 fn modified_millis(path: &Path) -> u64 {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -124,9 +159,9 @@ fn write_file(
     expected_modified: Option<u64>,
 ) -> Result<u64, String> {
     let target = PathBuf::from(&path);
-    let file_name = target.file_name().ok_or_else(|| {
-        "Le chemin d’enregistrement ne désigne pas un fichier.".to_string()
-    })?;
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| "Le chemin d’enregistrement ne désigne pas un fichier.".to_string())?;
     if let Some(expected) = expected_modified.filter(|value| *value > 0) {
         let current = modified_millis(&target);
         if current > 0 && current != expected {
@@ -175,10 +210,7 @@ fn list_directory(path: String) -> Result<DirectoryListing, String> {
     });
     let truncated = entries.len() > MAX_DIRECTORY_ENTRIES;
     entries.truncate(MAX_DIRECTORY_ENTRIES);
-    Ok(DirectoryListing {
-        entries,
-        truncated,
-    })
+    Ok(DirectoryListing { entries, truncated })
 }
 
 #[tauri::command(async)]
@@ -602,6 +634,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             read_file,
+            get_launch_files,
             write_file,
             rename_file,
             list_directory,
@@ -639,6 +672,15 @@ mod tests {
         let expression = build_search_regex("class", &options).expect("regex should compile");
         assert!(expression.is_match("class=\"hero\""));
         assert!(!expression.is_match("classification"));
+    }
+
+    #[test]
+    fn launch_file_support_is_case_insensitive_and_rejects_binaries() {
+        assert!(is_supported_file_path(Path::new("Component.TSX")));
+        assert!(is_supported_file_path(Path::new("main.rs")));
+        assert!(is_supported_file_path(Path::new("page.html")));
+        assert!(!is_supported_file_path(Path::new("archive.zip")));
+        assert!(!is_supported_file_path(Path::new("program.exe")));
     }
 
     #[test]
@@ -766,8 +808,7 @@ mod tests {
         let file = root.join("note.txt");
         fs::write(&file, "contenu").expect("fixture should be written");
 
-        let content = read_file(file.to_string_lossy().into_owned())
-            .expect("read should succeed");
+        let content = read_file(file.to_string_lossy().into_owned()).expect("read should succeed");
 
         assert_eq!(content.contents, "contenu");
         assert!(content.modified > 0);
@@ -782,15 +823,11 @@ mod tests {
         let path = file.to_string_lossy().into_owned();
 
         let content = read_file(path.clone()).expect("read should succeed");
-        let written =
-            write_file(path.clone(), "v2".to_string(), Some(content.modified))
-                .expect("fresh write should succeed");
+        let written = write_file(path.clone(), "v2".to_string(), Some(content.modified))
+            .expect("fresh write should succeed");
 
         assert!(written > 0);
-        assert_eq!(
-            fs::read_to_string(&file).expect("file should exist"),
-            "v2"
-        );
+        assert_eq!(fs::read_to_string(&file).expect("file should exist"), "v2");
         fs::remove_dir_all(root).expect("test directory should be removed");
     }
 
@@ -802,21 +839,18 @@ mod tests {
         let path = file.to_string_lossy().into_owned();
 
         let content = read_file(path.clone()).expect("read should succeed");
-        let refused =
-            write_file(path.clone(), "v2".to_string(), Some(content.modified + 60_000));
+        let refused = write_file(
+            path.clone(),
+            "v2".to_string(),
+            Some(content.modified + 60_000),
+        );
         assert!(refused.is_err());
-        assert_eq!(
-            fs::read_to_string(&file).expect("file should exist"),
-            "v1"
-        );
+        assert_eq!(fs::read_to_string(&file).expect("file should exist"), "v1");
 
-        let written = write_file(path.clone(), "v2".to_string(), None)
-            .expect("forced write should succeed");
+        let written =
+            write_file(path.clone(), "v2".to_string(), None).expect("forced write should succeed");
         assert!(written > 0);
-        assert_eq!(
-            read_file(path).expect("read should succeed").contents,
-            "v2"
-        );
+        assert_eq!(read_file(path).expect("read should succeed").contents, "v2");
         fs::remove_dir_all(root).expect("test directory should be removed");
     }
 
@@ -828,8 +862,8 @@ mod tests {
                 .expect("fixture should be written");
         }
 
-        let listing = list_directory(root.to_string_lossy().into_owned())
-            .expect("listing should succeed");
+        let listing =
+            list_directory(root.to_string_lossy().into_owned()).expect("listing should succeed");
 
         assert!(listing.truncated);
         assert_eq!(listing.entries.len(), MAX_DIRECTORY_ENTRIES);
@@ -871,8 +905,7 @@ mod tests {
         let root = test_directory();
         // « 🦀 » vaut 1 caractère mais 2 unités UTF-16 : la colonne Monaco
         // attendue est donc décalée d'une unité par rapport au comptage chars.
-        fs::write(root.join("sample.txt"), "🦀 const x = 1;\n")
-            .expect("fixture should be written");
+        fs::write(root.join("sample.txt"), "🦀 const x = 1;\n").expect("fixture should be written");
 
         let matches = search_directory(
             root.to_string_lossy().into_owned(),

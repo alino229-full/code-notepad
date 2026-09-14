@@ -916,6 +916,23 @@ async function restoreSessionAfterReload(): Promise<void> {
   saveSessionSnapshot();
 }
 
+async function openFilesFromWindows(): Promise<void> {
+  if (!isNativeApp) return;
+  try {
+    const paths = await invoke<string[]>("get_launch_files");
+    for (const path of paths) {
+      await openFilePath(normalizeDialogPath(path));
+    }
+  } catch (error) {
+    showToast("Ouverture Windows impossible", errorMessage(error), "error");
+  }
+}
+
+async function initializeSession(): Promise<void> {
+  await restoreSessionAfterReload();
+  await openFilesFromWindows();
+}
+
 function switchDocument(id: string, line?: number, column?: number): void {
   const next = documents.find((document) => document.id === id);
   if (!next) return;
@@ -2270,4 +2287,4 @@ setupResizers();
 setupSearchPanelDrag();
 registerActions();
 refreshChrome();
-void restoreSessionAfterReload();
+void initializeSession();
