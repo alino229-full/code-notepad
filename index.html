@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="fr" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>Code Notepad</title>
+    <script>
+      try {
+        document.documentElement.dataset.theme =
+          localStorage.getItem("code-notepad.theme") === "dark" ? "dark" : "light";
+      } catch {}
+    </script>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <div id="app">
+      <header id="titlebar" data-tauri-drag-region>
+        <div class="brand" data-tauri-drag-region>
+          <span class="brand-mark" aria-hidden="true">&lt;/&gt;</span>
+          <span>Code Notepad</span>
+        </div>
+
+        <nav class="app-menu" aria-label="Menu de l’application">
+          <div class="menu-wrap">
+            <button class="menu-trigger" id="menu-file-trigger" aria-haspopup="menu" aria-expanded="false">
+              Fichier
+            </button>
+            <div class="menu-popover" id="menu-file" role="menu" hidden>
+              <button role="menuitem" data-action="new-file"><span>Nouveau fichier</span><kbd>Ctrl N</kbd></button>
+              <button role="menuitem" data-action="open-file"><span>Ouvrir un fichier</span><kbd>Ctrl O</kbd></button>
+              <button role="menuitem" data-action="open-folder"><span>Ouvrir un dossier</span><kbd>Ctrl K</kbd></button>
+              <span class="menu-separator" role="separator"></span>
+              <button role="menuitem" data-action="save"><span>Enregistrer</span><kbd>Ctrl S</kbd></button>
+              <button role="menuitem" data-action="save-as"><span>Enregistrer sous</span><kbd>Ctrl Maj S</kbd></button>
+            </div>
+          </div>
+          <button class="menu-trigger" data-action="open-search">Édition</button>
+          <button class="menu-trigger" data-action="toggle-preview">Affichage</button>
+        </nav>
+
+        <div class="title-spacer" data-tauri-drag-region></div>
+
+        <button class="title-action theme-toggle" id="theme-toggle" type="button" aria-label="Activer le thème sombre" title="Changer de thème">
+          <span id="theme-icon"></span>
+        </button>
+        <div class="window-controls" aria-label="Contrôles de la fenêtre">
+          <button id="window-minimize" type="button" aria-label="Réduire" title="Réduire"></button>
+          <button id="window-maximize" type="button" aria-label="Agrandir" title="Agrandir"></button>
+          <button id="window-close" class="window-close" type="button" aria-label="Fermer" title="Fermer"></button>
+        </div>
+      </header>
+
+      <div id="commandbar">
+        <div class="command-group" aria-label="Fichier">
+          <button class="command-button" id="btn-new" type="button" title="Nouveau fichier (Ctrl+N)">
+            <span data-icon="newFile"></span><span>Nouveau</span>
+          </button>
+          <button class="command-button" id="btn-open" type="button" title="Ouvrir un fichier (Ctrl+O)">
+            <span data-icon="openFile"></span><span>Ouvrir</span>
+          </button>
+          <button class="command-button command-button-primary" id="btn-open-folder" type="button" title="Ouvrir un dossier (Ctrl+K)">
+            <span data-icon="folderOpen"></span><span>Ouvrir un dossier</span>
+          </button>
+          <button class="command-button" id="btn-save" type="button" title="Enregistrer (Ctrl+S)">
+            <span data-icon="save"></span><span>Enregistrer</span>
+          </button>
+        </div>
+
+        <div class="command-spacer" aria-hidden="true"></div>
+
+        <div class="command-group command-group-end">
+          <div class="menu-wrap">
+            <button class="command-button" id="recent-trigger" type="button" aria-haspopup="menu" aria-expanded="false">
+              <span data-icon="refresh"></span><span>Récents</span><span data-icon="chevronDown"></span>
+            </button>
+            <div class="menu-popover recent-popover" id="recent-menu" role="menu" hidden></div>
+          </div>
+          <button class="icon-button" id="btn-search" type="button" aria-label="Ouvrir la recherche avancée" title="Recherche avancée (Ctrl+F)">
+            <span data-icon="search"></span>
+          </button>
+          <button class="icon-button" id="btn-toggle-explorer" type="button" aria-label="Masquer l’explorateur" title="Afficher ou masquer l’explorateur">
+            <span data-icon="panelLeft"></span>
+          </button>
+          <button class="icon-button" id="btn-toggle-preview" type="button" aria-label="Afficher l’aperçu local" title="Afficher ou masquer l’aperçu local (Ctrl+Maj+V)">
+            <span data-icon="preview"></span>
+          </button>
+        </div>
+        <span class="preview-route" id="preview-route" aria-hidden="true"></span>
+      </div>
+
+      <main id="workspace">
+        <aside id="explorer-panel" aria-label="Explorateur de fichiers">
+          <div class="panel-header">
+            <div>
+              <span class="eyebrow">SESSION</span>
+              <h1 id="explorer-title">Explorateur</h1>
+            </div>
+            <button class="icon-button small" id="btn-close-folder" type="button" aria-label="Fermer le dossier de la session" title="Fermer le dossier" hidden>
+              <span data-icon="close"></span>
+            </button>
+          </div>
+          <div id="explorer-content" class="explorer-content"></div>
+        </aside>
+
+        <div class="pane-resizer" id="explorer-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Redimensionner l’explorateur"></div>
+
+        <section id="editor-panel" aria-label="Éditeur de code">
+          <div id="tabs" class="tabs" role="tablist" aria-label="Fichiers ouverts"></div>
+
+          <div id="editor-stage">
+            <div id="welcome" class="welcome"></div>
+            <div id="editor" aria-label="Contenu du fichier"></div>
+
+            <section id="search-panel" class="search-panel" aria-label="Recherche avancée" hidden>
+              <div class="search-titlebar">
+                <div>
+                  <span class="eyebrow">RECHERCHE AVANCÉE</span>
+                  <strong id="search-context">Dans le fichier actif</strong>
+                </div>
+                <button class="icon-button small" id="search-close" type="button" aria-label="Fermer la recherche" title="Fermer">
+                  <span data-icon="close"></span>
+                </button>
+              </div>
+
+              <div class="search-fields">
+                <label for="search-query">Rechercher</label>
+                <div class="input-shell">
+                  <span data-icon="search"></span>
+                  <input id="search-query" type="text" autocomplete="off" spellcheck="false" />
+                  <button id="search-clear" class="field-action" type="button" aria-label="Effacer la recherche" title="Effacer" hidden>
+                    <span data-icon="close"></span>
+                  </button>
+                </div>
+
+                <label for="replace-value">Remplacer</label>
+                <div class="input-shell">
+                  <input id="replace-value" type="text" autocomplete="off" spellcheck="false" />
+                </div>
+              </div>
+
+              <div class="search-options" aria-label="Options de recherche">
+                <label><input id="search-case" type="checkbox" /> <span>Respecter la casse</span></label>
+                <label><input id="search-word" type="checkbox" /> <span>Mot entier</span></label>
+                <label><input id="search-regex" type="checkbox" /> <span>Expression régulière</span></label>
+                <label><input id="search-live" type="checkbox" checked /> <span>Rechercher en saisissant</span></label>
+                <div class="scope-switch" aria-label="Portée de la recherche">
+                  <button id="scope-file" type="button" aria-pressed="true">Fichier</button>
+                  <button id="scope-folder" type="button" aria-pressed="false">Dossier</button>
+                </div>
+              </div>
+
+              <div class="search-actions">
+                <span id="search-count" class="search-count" role="status" aria-live="polite">Saisissez un terme</span>
+                <div class="search-action-buttons">
+                  <button class="icon-button" id="search-previous" type="button" aria-label="Occurrence précédente" title="Occurrence précédente">
+                    <span data-icon="undo"></span>
+                  </button>
+                  <button class="icon-button" id="search-next" type="button" aria-label="Occurrence suivante" title="Occurrence suivante">
+                    <span data-icon="redo"></span>
+                  </button>
+                  <button class="button-secondary" id="replace-one" type="button">Remplacer</button>
+                  <button class="button-secondary" id="replace-all" type="button">Tout remplacer</button>
+                  <button class="button-primary" id="search-submit" type="button">Rechercher</button>
+                </div>
+              </div>
+
+              <div id="folder-results" class="folder-results" aria-label="Résultats dans le dossier" hidden></div>
+            </section>
+          </div>
+        </section>
+
+        <div class="pane-resizer" id="preview-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Redimensionner l’aperçu" hidden></div>
+
+        <aside id="preview-panel" aria-label="Aperçu HTML local" hidden>
+          <div class="preview-header">
+            <div class="preview-heading">
+              <span class="preview-globe" data-icon="preview"></span>
+              <div>
+                <span class="eyebrow">NAVIGATEUR INTÉGRÉ</span>
+                <strong>Aperçu local</strong>
+              </div>
+            </div>
+            <div class="preview-actions">
+              <button class="icon-button small" id="preview-refresh" type="button" aria-label="Actualiser l’aperçu" title="Enregistrer puis actualiser">
+                <span data-icon="refresh"></span>
+              </button>
+              <button class="icon-button small" id="preview-external" type="button" aria-label="Ouvrir dans le navigateur par défaut" title="Ouvrir dans le navigateur par défaut">
+                <span data-icon="external"></span>
+              </button>
+              <button class="icon-button small" id="preview-close" type="button" aria-label="Fermer l’aperçu" title="Fermer l’aperçu">
+                <span data-icon="close"></span>
+              </button>
+            </div>
+          </div>
+          <div class="preview-address">
+            <span class="sync-dot" aria-hidden="true"></span>
+            <span id="preview-path">Sélectionnez un fichier HTML enregistré</span>
+          </div>
+          <div id="preview-empty" class="preview-empty">
+            <span class="preview-empty-icon" data-icon="preview"></span>
+            <strong>Aucun aperçu disponible</strong>
+            <p>Ouvrez un fichier HTML enregistré pour afficher son rendu et ses ressources locales.</p>
+          </div>
+          <iframe
+            id="preview-frame"
+            title="Rendu HTML local"
+            sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
+            referrerpolicy="no-referrer"
+            hidden
+          ></iframe>
+        </aside>
+      </main>
+
+      <footer id="statusbar">
+        <div class="status-group">
+          <span id="status-state">Prêt</span>
+          <span id="status-path">Aucun fichier ouvert</span>
+        </div>
+        <div class="status-group status-group-end">
+          <label class="sr-only" for="language-select">Langage du fichier</label>
+          <select id="language-select" title="Choisir le langage"></select>
+          <span>UTF-8</span>
+          <span id="status-position">Ln 1, Col 1</span>
+        </div>
+      </footer>
+    </div>
+
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-description">
+      <form method="dialog">
+        <div class="dialog-mark" aria-hidden="true">!</div>
+        <div class="dialog-copy">
+          <h2 id="confirm-title">Modifications non enregistrées</h2>
+          <p id="confirm-description"></p>
+        </div>
+        <div class="dialog-actions">
+          <button id="confirm-cancel" class="button-secondary" value="cancel">Annuler</button>
+          <button id="confirm-accept" class="button-danger" value="confirm">Fermer sans enregistrer</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>
