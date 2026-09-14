@@ -1,7 +1,9 @@
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
+    time::UNIX_EPOCH,
 };
 
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
@@ -11,6 +13,10 @@ use tauri::http::{header, Request, Response, StatusCode};
 
 const MAX_SEARCH_MATCHES: usize = 500;
 const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PROJECT_SOURCE_FILES: usize = 500;
+const MAX_PROJECT_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SINGLE_SOURCE_BYTES: u64 = 512 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 2_000;
 
 #[derive(Clone, Default)]
 struct PreviewState(Arc<RwLock<Option<PathBuf>>>);
@@ -22,6 +28,20 @@ struct FileEntry {
     path: String,
     is_directory: bool,
     is_symlink: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryListing {
+    entries: Vec<FileEntry>,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileContent {
+    contents: String,
+    modified: u64,
 }
 
 #[derive(Deserialize)]
@@ -42,18 +62,86 @@ struct DirectorySearchMatch {
     line_text: String,
 }
 
-#[tauri::command]
-fn read_file(path: String) -> Result<String, String> {
-    fs::read_to_string(&path).map_err(|error| format!("Lecture impossible : {error}"))
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSourceFile {
+    path: String,
+    contents: String,
 }
 
-#[tauri::command]
-fn write_file(path: String, contents: String) -> Result<(), String> {
-    fs::write(&path, contents).map_err(|error| format!("Écriture impossible : {error}"))
+fn modified_millis(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
-#[tauri::command]
-fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
+#[tauri::command(async)]
+fn read_file(path: String) -> Result<FileContent, String> {
+    let contents =
+        fs::read_to_string(&path).map_err(|error| format!("Lecture impossible : {error}"))?;
+    Ok(FileContent {
+        modified: modified_millis(Path::new(&path)),
+        contents,
+    })
+}
+
+#[tauri::command(async)]
+fn rename_file(source: String, target: String) -> Result<u64, String> {
+    let from = PathBuf::from(&source);
+    let to = PathBuf::from(&target);
+    if !from.is_file() {
+        return Err("Le fichier à renommer est introuvable.".to_string());
+    }
+    if to.exists() {
+        return Err("Un fichier du même nom existe déjà à l’emplacement cible.".to_string());
+    }
+    fs::rename(&from, &to).map_err(|error| format!("Renommage impossible : {error}"))?;
+    Ok(modified_millis(&to))
+}
+
+fn atomic_write(target: &Path, file_name: &OsStr, contents: &str) -> Result<(), String> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    fs::write(&temporary, contents).map_err(|error| format!("Écriture impossible : {error}"))?;
+    if fs::rename(&temporary, target).is_ok() {
+        return Ok(());
+    }
+    let _ = fs::remove_file(&temporary);
+    fs::write(target, contents).map_err(|error| format!("Écriture impossible : {error}"))
+}
+
+#[tauri::command(async)]
+fn write_file(
+    path: String,
+    contents: String,
+    expected_modified: Option<u64>,
+) -> Result<u64, String> {
+    let target = PathBuf::from(&path);
+    let file_name = target.file_name().ok_or_else(|| {
+        "Le chemin d’enregistrement ne désigne pas un fichier.".to_string()
+    })?;
+    if let Some(expected) = expected_modified.filter(|value| *value > 0) {
+        let current = modified_millis(&target);
+        if current > 0 && current != expected {
+            return Err(
+                "MODIFIED_EXTERNALLY: le fichier a été modifié en dehors de l’application."
+                    .to_string(),
+            );
+        }
+    }
+    atomic_write(&target, file_name, &contents)?;
+    Ok(modified_millis(&target))
+}
+
+#[tauri::command(async)]
+fn list_directory(path: String) -> Result<DirectoryListing, String> {
     let directory = PathBuf::from(&path);
     if !directory.is_dir() {
         return Err("Le chemin sélectionné n’est pas un dossier.".to_string());
@@ -85,7 +173,76 @@ fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
             .cmp(&left.is_directory)
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
-    Ok(entries)
+    let truncated = entries.len() > MAX_DIRECTORY_ENTRIES;
+    entries.truncate(MAX_DIRECTORY_ENTRIES);
+    Ok(DirectoryListing {
+        entries,
+        truncated,
+    })
+}
+
+#[tauri::command(async)]
+fn index_project_sources(root: String) -> Result<Vec<ProjectSourceFile>, String> {
+    let root = fs::canonicalize(&root)
+        .map_err(|error| format!("Dossier du projet inaccessible : {error}"))?;
+    if !root.is_dir() {
+        return Err("Le chemin du projet n’est pas un dossier.".to_string());
+    }
+
+    let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut directories = vec![root];
+    while let Some(directory) = directories.pop() {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for result in entries {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !is_ignored_project_directory(&path) {
+                    directories.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() || !is_typescript_project_source(&path) {
+                continue;
+            }
+            let size = match entry.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(_) => continue,
+            };
+            if size > MAX_SINGLE_SOURCE_BYTES
+                || total_bytes.saturating_add(size) > MAX_PROJECT_SOURCE_BYTES
+            {
+                continue;
+            }
+            let contents = match fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(_) => continue,
+            };
+            total_bytes += size;
+            files.push(ProjectSourceFile {
+                path: path.to_string_lossy().into_owned(),
+                contents,
+            });
+            if files.len() >= MAX_PROJECT_SOURCE_FILES {
+                return Ok(files);
+            }
+        }
+    }
+    Ok(files)
 }
 
 #[tauri::command]
@@ -136,6 +293,16 @@ fn prepare_preview(
 }
 
 #[tauri::command]
+fn clear_preview(state: tauri::State<'_, PreviewState>) -> Result<(), String> {
+    let mut guard = state
+        .0
+        .write()
+        .map_err(|_| "Le service d’aperçu est momentanément indisponible.".to_string())?;
+    *guard = None;
+    Ok(())
+}
+
+#[tauri::command(async)]
 fn search_directory(
     root: String,
     query: String,
@@ -172,7 +339,9 @@ fn search_directory(
             }
             let path = entry.path();
             if file_type.is_dir() {
-                directories.push(path);
+                if !is_ignored_project_directory(&path) {
+                    directories.push(path);
+                }
                 continue;
             }
             if !file_type.is_file() || !is_searchable_file(&path) {
@@ -196,7 +365,9 @@ fn search_directory(
                 .into_owned();
             for (line_index, line) in contents.lines().enumerate() {
                 for found in expression.find_iter(line) {
-                    let column = line[..found.start()].chars().count() + 1;
+                    // Monaco compte les colonnes en unités UTF-16 : un même
+                    // comptage côté Rust garantit un positionnement exact.
+                    let column = line[..found.start()].encode_utf16().count() + 1;
                     matches.push(DirectorySearchMatch {
                         path: path.to_string_lossy().into_owned(),
                         relative_path: relative_path.clone(),
@@ -301,6 +472,37 @@ fn is_searchable_file(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
+fn is_typescript_project_source(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "json")
+    )
+}
+
+fn is_ignored_project_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            ".git"
+                | ".next"
+                | ".nuxt"
+                | ".output"
+                | ".svelte-kit"
+                | ".turbo"
+                | ".vite"
+                | "coverage"
+                | "dist"
+                | "build"
+                | "node_modules"
+                | "target"
+                | "vendor"
+        )
+    )
+}
+
 fn truncate_line(line: &str, limit: usize) -> String {
     let mut chars = line.chars();
     let truncated: String = chars.by_ref().take(limit).collect();
@@ -397,11 +599,15 @@ pub fn run() {
         })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             read_file,
             write_file,
+            rename_file,
             list_directory,
+            index_project_sources,
             prepare_preview,
+            clear_preview,
             search_directory
         ])
         .run(tauri::generate_context!())
@@ -457,12 +663,16 @@ mod tests {
     fn directory_search_reads_nested_code_files() {
         let root = test_directory();
         let assets = root.join("assets");
+        let generated = root.join(".next").join("server");
         fs::create_dir_all(&assets).expect("nested directory should be created");
+        fs::create_dir_all(&generated).expect("generated directory should be created");
         fs::write(
             assets.join("app.js"),
             "const title = 'Code Notepad';\nconsole.log(title);\n",
         )
         .expect("fixture should be written");
+        fs::write(generated.join("chunk.js"), "const title = 'Code Notepad';")
+            .expect("generated fixture should be written");
 
         let matches = search_directory(
             root.to_string_lossy().into_owned(),
@@ -481,6 +691,30 @@ mod tests {
                 || matches[0].relative_path.ends_with("assets/app.js")
         );
         fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn project_index_keeps_sources_and_skips_dependencies() {
+        let directory = test_directory();
+        let source = directory.join("src");
+        let dependencies = directory.join("node_modules").join("package");
+        fs::create_dir_all(&source).expect("source directory should be created");
+        fs::create_dir_all(&dependencies).expect("dependency directory should be created");
+        fs::write(source.join("main.ts"), "export const ready = true;")
+            .expect("source should be written");
+        fs::write(
+            dependencies.join("index.ts"),
+            "export const ignored = true;",
+        )
+        .expect("dependency should be written");
+
+        let indexed = index_project_sources(directory.to_string_lossy().into_owned())
+            .expect("project should be indexed");
+
+        assert_eq!(indexed.len(), 1);
+        assert!(indexed[0].path.ends_with("main.ts"));
+        assert!(indexed[0].contents.contains("ready"));
+        fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 
     #[test]
@@ -523,6 +757,136 @@ mod tests {
         let response = serve_preview(&state, request);
 
         assert_ne!(response.status(), StatusCode::OK);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn read_file_reports_modification_time() {
+        let root = test_directory();
+        let file = root.join("note.txt");
+        fs::write(&file, "contenu").expect("fixture should be written");
+
+        let content = read_file(file.to_string_lossy().into_owned())
+            .expect("read should succeed");
+
+        assert_eq!(content.contents, "contenu");
+        assert!(content.modified > 0);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn write_file_accepts_fresh_modification_time() {
+        let root = test_directory();
+        let file = root.join("note.txt");
+        fs::write(&file, "v1").expect("fixture should be written");
+        let path = file.to_string_lossy().into_owned();
+
+        let content = read_file(path.clone()).expect("read should succeed");
+        let written =
+            write_file(path.clone(), "v2".to_string(), Some(content.modified))
+                .expect("fresh write should succeed");
+
+        assert!(written > 0);
+        assert_eq!(
+            fs::read_to_string(&file).expect("file should exist"),
+            "v2"
+        );
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn write_file_refuses_stale_modification_until_forced() {
+        let root = test_directory();
+        let file = root.join("note.txt");
+        fs::write(&file, "v1").expect("fixture should be written");
+        let path = file.to_string_lossy().into_owned();
+
+        let content = read_file(path.clone()).expect("read should succeed");
+        let refused =
+            write_file(path.clone(), "v2".to_string(), Some(content.modified + 60_000));
+        assert!(refused.is_err());
+        assert_eq!(
+            fs::read_to_string(&file).expect("file should exist"),
+            "v1"
+        );
+
+        let written = write_file(path.clone(), "v2".to_string(), None)
+            .expect("forced write should succeed");
+        assert!(written > 0);
+        assert_eq!(
+            read_file(path).expect("read should succeed").contents,
+            "v2"
+        );
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn directory_listing_is_truncated_with_flag() {
+        let root = test_directory();
+        for index in 0..=(MAX_DIRECTORY_ENTRIES) {
+            fs::write(root.join(format!("fichier-{index:05}.txt")), "x")
+                .expect("fixture should be written");
+        }
+
+        let listing = list_directory(root.to_string_lossy().into_owned())
+            .expect("listing should succeed");
+
+        assert!(listing.truncated);
+        assert_eq!(listing.entries.len(), MAX_DIRECTORY_ENTRIES);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn rename_file_moves_without_overwriting() {
+        let root = test_directory();
+        let source = root.join("avant.txt");
+        let target = root.join("apres.txt");
+        fs::write(&source, "contenu").expect("fixture should be written");
+        fs::write(&target, "existant").expect("fixture should be written");
+
+        let refused = rename_file(
+            source.to_string_lossy().into_owned(),
+            target.to_string_lossy().into_owned(),
+        );
+        assert!(refused.is_err());
+        assert!(source.is_file());
+
+        let renamed = rename_file(
+            source.to_string_lossy().into_owned(),
+            root.join("autre.txt").to_string_lossy().into_owned(),
+        )
+        .expect("rename should succeed");
+        assert!(renamed > 0);
+        assert!(!source.exists());
+        let moved = root.join("autre.txt");
+        assert_eq!(
+            fs::read_to_string(&moved).expect("moved file should exist"),
+            "contenu"
+        );
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn directory_search_reports_utf16_columns() {
+        let root = test_directory();
+        // « 🦀 » vaut 1 caractère mais 2 unités UTF-16 : la colonne Monaco
+        // attendue est donc décalée d'une unité par rapport au comptage chars.
+        fs::write(root.join("sample.txt"), "🦀 const x = 1;\n")
+            .expect("fixture should be written");
+
+        let matches = search_directory(
+            root.to_string_lossy().into_owned(),
+            "x".to_string(),
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: false,
+                regex: false,
+            },
+        )
+        .expect("search should succeed");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].column, 10);
         fs::remove_dir_all(root).expect("test directory should be removed");
     }
 }

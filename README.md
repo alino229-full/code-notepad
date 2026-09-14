@@ -6,11 +6,14 @@
 
 - ouverture d’un fichier seul ou d’un dossier avec arborescence paresseuse des sous-dossiers ;
 - onglets de session fermables, avec protection des modifications non enregistrées ;
+- enregistrement atomique avec détection des modifications externes : un fichier changé par une autre application ne peut être écrasé qu’après confirmation ;
 - historique persistant des fichiers et dossiers récents, sans restauration forcée de l’ancienne session ;
 - coloration syntaxique et sélection manuelle du langage via Monaco Editor ;
 - recherche avancée dans le fichier actif : casse, mot entier, expression régulière, navigation et remplacement ;
+- menus Fichier, Édition (annuler, presse-papiers, sélection, recherche et remplacement) et Navigateur ;
+- menu contextuel de l'éditeur en français : enregistrer, renommer le fichier actif, presse-papiers, recherche et remplacement ;
 - recherche récursive dans les fichiers texte du dossier ouvert ;
-- aperçu HTML intégré avec chargement des CSS, images et scripts locaux du dossier ;
+- navigateur intégré : rendu des fichiers HTML locaux avec leurs CSS, images et scripts, et navigation libre par chemin local ou adresse http(s) saisie dans la barre d'adresse ;
 - thèmes clair « Atelier optique » et sombre « Studio nocturne » ;
 - interface clavier, focus visible, réduction des animations et dialogues accessibles.
 
@@ -32,6 +35,6 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-## Sécurité de l’aperçu
+## Sécurité du navigateur intégré
 
-Le navigateur intégré sert uniquement les ressources situées dans le dossier de travail autorisé. Les traversées de chemin sont bloquées, le cache est désactivé pour refléter les changements enregistrés et la page est exécutée dans une iframe isolée de l’interface Tauri.
+Le service de fichiers local ne sert que les ressources du dossier de travail autorisé : les traversées de chemin sont bloquées et le cache est désactivé pour refléter les changements enregistrés. Les pages — locales comme distantes — s'exécutent dans une iframe isolée de l'interface Tauri (origine opaque, sans accès IPC). Pendant l'affichage d'une page distante, le service de fichiers local est suspendu : aucune ressource locale ne peut être relue par cette page.

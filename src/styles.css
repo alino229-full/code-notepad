@@ -191,17 +191,10 @@ input:focus-visible,
 }
 
 .brand-mark {
-  display: grid;
   width: 25px;
   height: 25px;
-  place-items: center;
-  border-radius: 7px;
-  background: var(--accent);
-  color: var(--accent-contrast);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-weight: 700;
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 18%);
+  flex: 0 0 auto;
+  object-fit: contain;
 }
 
 .app-menu {
@@ -351,6 +344,13 @@ input:focus-visible,
   height: 1px;
   margin: 5px 4px;
   background: var(--border);
+}
+
+.editor-context-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 90;
 }
 
 #commandbar {
@@ -681,6 +681,12 @@ input:focus-visible,
   height: 13px;
 }
 
+.tree-truncated {
+  padding: 4px 7px 4px 38px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
 .file-glyph {
   display: grid;
   width: 19px;
@@ -1006,11 +1012,11 @@ input:focus-visible,
 }
 
 .search-panel {
-  position: absolute;
-  z-index: 45;
+  position: fixed;
+  z-index: 65;
   top: 14px;
   right: 18px;
-  width: min(660px, calc(100% - 36px));
+  width: min(516px, calc(100% - 36px));
   max-height: calc(100% - 28px);
   overflow: auto;
   border: 1px solid var(--border-strong);
@@ -1027,6 +1033,22 @@ input:focus-visible,
   gap: 16px;
   padding: 7px 9px 7px 13px;
   border-bottom: 1px solid var(--border);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.search-titlebar:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.search-panel.is-dragged {
+  cursor: grabbing;
+}
+
+.search-panel.is-dragged .search-titlebar {
+  cursor: grabbing;
 }
 
 .search-titlebar strong {
@@ -1105,10 +1127,10 @@ input:focus-visible,
 }
 
 .search-options {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, max-content)) auto;
+  gap: 6px 14px;
   align-items: center;
-  gap: 7px 14px;
   padding: 3px 13px 10px 99px;
 }
 
@@ -1135,6 +1157,12 @@ input[type="checkbox"] {
   background: var(--surface-muted);
 }
 
+.search-options > .scope-switch {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  justify-self: end;
+}
+
 .scope-switch button {
   min-height: 25px;
   padding: 0 9px;
@@ -1154,9 +1182,10 @@ input[type="checkbox"] {
 .search-actions {
   display: flex;
   min-height: 49px;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px 12px;
   padding: 8px 13px;
   border-top: 1px solid var(--border);
 }
@@ -1303,6 +1332,31 @@ input[type="checkbox"] {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+#preview-url {
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+}
+
+#preview-url::placeholder {
+  color: var(--text-muted);
+}
+
+#preview-url:focus {
+  color: var(--text);
+  outline: none;
+}
+
+#preview-url:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .sync-dot {

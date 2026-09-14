@@ -69,7 +69,7 @@ Sora porte seulement l'identité, l'accueil et les titres courts. IBM Plex Sans 
 
 ## Layout
 
-La fenêtre se compose d'une barre de titre compacte, d'une barre d'actions, puis d'un espace de travail redimensionnable : explorateur, éditeur et aperçu. L'explorateur peut être fermé, l'aperçu peut être affiché uniquement pour les documents HTML enregistrés, et chaque séparateur accepte la souris comme le clavier. L'accueil des récents remplace l'éditeur quand aucun document n'est ouvert afin de ne pas consommer d'espace permanent.
+La fenêtre se compose d'une barre de titre compacte, d'une barre d'actions, puis d'un espace de travail redimensionnable : explorateur, éditeur et navigateur. L'explorateur peut être fermé, le navigateur affiche les documents HTML enregistrés ou toute adresse saisie dans sa barre (chemin local, serveur local ou http/https), et chaque séparateur accepte la souris comme le clavier. L'accueil des récents remplace l'éditeur quand aucun document n'est ouvert afin de ne pas consommer d'espace permanent.
 
 ## Elevation & Depth
 

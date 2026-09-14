@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
+    <link rel="icon" type="image/png" href="./src-tauri/icons/128x128.png" />
     <link rel="stylesheet" href="/src/styles.css" />
     <title>Code Notepad</title>
     <script>
@@ -19,7 +20,7 @@
     <div id="app">
       <header id="titlebar" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>
-          <span class="brand-mark" aria-hidden="true">&lt;/&gt;</span>
+          <img class="brand-mark" src="./src-tauri/icons/128x128.png" alt="" aria-hidden="true" />
           <span>Code Notepad</span>
         </div>
 
@@ -37,8 +38,25 @@
               <button role="menuitem" data-action="save-as"><span>Enregistrer sous</span><kbd>Ctrl Maj S</kbd></button>
             </div>
           </div>
-          <button class="menu-trigger" data-action="open-search">Édition</button>
-          <button class="menu-trigger" data-action="toggle-preview">Affichage</button>
+          <div class="menu-wrap">
+            <button class="menu-trigger" id="menu-edit-trigger" aria-haspopup="menu" aria-expanded="false">
+              Édition
+            </button>
+            <div class="menu-popover" id="menu-edit" role="menu" hidden>
+              <button role="menuitem" data-action="undo"><span>Annuler</span><kbd>Ctrl Z</kbd></button>
+              <button role="menuitem" data-action="redo"><span>Rétablir</span><kbd>Ctrl Y</kbd></button>
+              <span class="menu-separator" role="separator"></span>
+              <button role="menuitem" data-action="cut"><span>Couper</span><kbd>Ctrl X</kbd></button>
+              <button role="menuitem" data-action="copy"><span>Copier</span><kbd>Ctrl C</kbd></button>
+              <button role="menuitem" data-action="paste"><span>Coller</span><kbd>Ctrl V</kbd></button>
+              <span class="menu-separator" role="separator"></span>
+              <button role="menuitem" data-action="select-all"><span>Tout sélectionner</span><kbd>Ctrl A</kbd></button>
+              <span class="menu-separator" role="separator"></span>
+              <button role="menuitem" data-action="open-search"><span>Rechercher…</span><kbd>Ctrl F</kbd></button>
+              <button role="menuitem" data-action="open-replace"><span>Remplacer…</span><kbd>Ctrl H</kbd></button>
+            </div>
+          </div>
+          <button class="menu-trigger" data-action="toggle-preview">Navigateur</button>
         </nav>
 
         <div class="title-spacer" data-tauri-drag-region></div>
@@ -84,7 +102,7 @@
           <button class="icon-button" id="btn-toggle-explorer" type="button" aria-label="Masquer l’explorateur" title="Afficher ou masquer l’explorateur">
             <span data-icon="panelLeft"></span>
           </button>
-          <button class="icon-button" id="btn-toggle-preview" type="button" aria-label="Afficher l’aperçu local" title="Afficher ou masquer l’aperçu local (Ctrl+Maj+V)">
+          <button class="icon-button" id="btn-toggle-preview" type="button" aria-label="Afficher le navigateur" title="Afficher ou masquer le navigateur (Ctrl+Maj+V)">
             <span data-icon="preview"></span>
           </button>
         </div>
@@ -95,7 +113,6 @@
         <aside id="explorer-panel" aria-label="Explorateur de fichiers">
           <div class="panel-header">
             <div>
-              <span class="eyebrow">SESSION</span>
               <h1 id="explorer-title">Explorateur</h1>
             </div>
             <button class="icon-button small" id="btn-close-folder" type="button" aria-label="Fermer le dossier de la session" title="Fermer le dossier" hidden>
@@ -174,39 +191,46 @@
 
         <div class="pane-resizer" id="preview-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Redimensionner l’aperçu" hidden></div>
 
-        <aside id="preview-panel" aria-label="Aperçu HTML local" hidden>
+        <aside id="preview-panel" aria-label="Navigateur intégré" hidden>
           <div class="preview-header">
             <div class="preview-heading">
               <span class="preview-globe" data-icon="preview"></span>
               <div>
                 <span class="eyebrow">NAVIGATEUR INTÉGRÉ</span>
-                <strong>Aperçu local</strong>
+                <strong>Navigateur</strong>
               </div>
             </div>
             <div class="preview-actions">
-              <button class="icon-button small" id="preview-refresh" type="button" aria-label="Actualiser l’aperçu" title="Enregistrer puis actualiser">
+              <button class="icon-button small" id="preview-refresh" type="button" aria-label="Actualiser la page" title="Actualiser la page (enregistre le fichier local actif)">
                 <span data-icon="refresh"></span>
               </button>
               <button class="icon-button small" id="preview-external" type="button" aria-label="Ouvrir dans le navigateur par défaut" title="Ouvrir dans le navigateur par défaut">
                 <span data-icon="external"></span>
               </button>
-              <button class="icon-button small" id="preview-close" type="button" aria-label="Fermer l’aperçu" title="Fermer l’aperçu">
+              <button class="icon-button small" id="preview-close" type="button" aria-label="Fermer le navigateur" title="Fermer le navigateur">
                 <span data-icon="close"></span>
               </button>
             </div>
           </div>
-          <div class="preview-address">
+          <form class="preview-address" id="preview-form">
             <span class="sync-dot" aria-hidden="true"></span>
-            <span id="preview-path">Sélectionnez un fichier HTML enregistré</span>
-          </div>
+            <input
+              id="preview-url"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Chemin local ou adresse http(s)…"
+              aria-label="Adresse de la page affichée"
+            />
+          </form>
           <div id="preview-empty" class="preview-empty">
             <span class="preview-empty-icon" data-icon="preview"></span>
-            <strong>Aucun aperçu disponible</strong>
-            <p>Ouvrez un fichier HTML enregistré pour afficher son rendu et ses ressources locales.</p>
+            <strong>Aucune page affichée</strong>
+            <p>Saisissez un chemin local ou une adresse http(s) ci-dessus, ou ouvrez un fichier HTML enregistré pour afficher son rendu.</p>
           </div>
           <iframe
             id="preview-frame"
-            title="Rendu HTML local"
+            title="Page affichée"
             sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"
             referrerpolicy="no-referrer"
             hidden
@@ -241,6 +265,21 @@
         </div>
       </form>
     </dialog>
+
+    <div id="editor-context-menu" class="menu-popover editor-context-menu" role="menu" aria-label="Menu contextuel de l’éditeur" hidden>
+      <button role="menuitem" data-ctx="save"><span>Enregistrer</span><kbd>Ctrl S</kbd></button>
+      <button role="menuitem" data-ctx="rename"><span>Renommer…</span></button>
+      <span class="menu-separator" role="separator"></span>
+      <button role="menuitem" data-ctx="cut"><span>Couper</span><kbd>Ctrl X</kbd></button>
+      <button role="menuitem" data-ctx="copy"><span>Copier</span><kbd>Ctrl C</kbd></button>
+      <button role="menuitem" data-ctx="paste"><span>Coller</span><kbd>Ctrl V</kbd></button>
+      <span class="menu-separator" role="separator"></span>
+      <button role="menuitem" data-ctx="search"><span>Rechercher…</span><kbd>Ctrl F</kbd></button>
+      <button role="menuitem" data-ctx="replace"><span>Remplacer…</span><kbd>Ctrl H</kbd></button>
+      <button role="menuitem" data-ctx="occurrences"><span>Changer toutes les occurrences</span><kbd>Ctrl F2</kbd></button>
+      <span class="menu-separator" role="separator"></span>
+      <button role="menuitem" data-ctx="select-all"><span>Tout sélectionner</span><kbd>Ctrl A</kbd></button>
+    </div>
 
     <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   </body>

@@ -7,8 +7,9 @@ import "@fontsource/jetbrains-mono/latin-600.css";
 
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import * as monaco from "monaco-editor";
 
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
@@ -20,9 +21,13 @@ import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker"
 import { icon, type IconName } from "./icons";
 import { readRecents, readTheme, rememberRecent, removeRecent, saveTheme } from "./storage";
 import type {
+  BrowserTarget,
+  DirectoryListing,
   DirectorySearchMatch,
+  FileContent,
   FileEntry,
   OpenDocument,
+  ProjectSourceFile,
   RecentEntry,
   SearchOptions,
   SearchScope,
@@ -45,6 +50,72 @@ const isNativeApp = isTauri();
 const appWindow = isNativeApp ? getCurrentWindow() : null;
 const WORD_SEPARATORS = "~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 const HTML_EXTENSIONS = new Set(["html", "htm"]);
+const TYPESCRIPT_IMPORT_DIAGNOSTICS_TO_IGNORE = [2307, 2792, 7016];
+const MODIFIED_EXTERNALLY_PREFIX = "MODIFIED_EXTERNALLY:";
+const SESSION_STORAGE_KEY = "code-notepad.session";
+
+// Types proposés dans les boîtes de dialogue ouvrir / enregistrer / renommer,
+// pour filtrer d'un geste plutôt que saisir une extension à la main.
+const FILE_TYPE_FILTERS: { name: string; extensions: string[] }[] = [
+  { name: "Tous les fichiers", extensions: ["*"] },
+  { name: "Texte", extensions: ["txt"] },
+  { name: "HTML", extensions: ["html", "htm"] },
+  { name: "CSS", extensions: ["css", "scss", "less"] },
+  { name: "JavaScript", extensions: ["js", "mjs", "cjs", "jsx"] },
+  { name: "TypeScript", extensions: ["ts", "tsx", "mts", "cts"] },
+  { name: "JSON", extensions: ["json"] },
+  { name: "Markdown", extensions: ["md", "markdown"] },
+  { name: "XML / SVG", extensions: ["xml", "svg"] },
+  { name: "YAML", extensions: ["yml", "yaml"] },
+  { name: "Python", extensions: ["py"] },
+  { name: "Rust", extensions: ["rs"] },
+  { name: "PHP", extensions: ["php"] },
+  { name: "Java", extensions: ["java"] },
+  { name: "C / C++", extensions: ["c", "h", "cc", "cpp", "hpp"] },
+  { name: "C#", extensions: ["cs"] },
+  { name: "SQL", extensions: ["sql"] },
+  { name: "Shell / PowerShell", extensions: ["sh", "ps1"] },
+];
+
+// Extension par défaut selon le langage du document : préremplit le nom lors
+// d'un premier enregistrement (« Nouveau-1 » + HTML → « Nouveau-1.html »).
+const LANGUAGE_DEFAULT_EXTENSIONS: Record<string, string> = {
+  html: ".html",
+  css: ".css",
+  scss: ".scss",
+  less: ".less",
+  javascript: ".js",
+  typescript: ".ts",
+  json: ".json",
+  markdown: ".md",
+  xml: ".xml",
+  yaml: ".yml",
+  python: ".py",
+  rust: ".rs",
+  php: ".php",
+  java: ".java",
+  csharp: ".cs",
+  cpp: ".cpp",
+  c: ".c",
+  sql: ".sql",
+  shell: ".sh",
+  vue: ".vue",
+  svelte: ".svelte",
+  plaintext: ".txt",
+};
+
+function defaultExtensionForLanguage(language: string): string {
+  return LANGUAGE_DEFAULT_EXTENSIONS[language] ?? ".txt";
+}
+
+function fileNameHasExtension(path: string): boolean {
+  const name = fileNameFromPath(path);
+  // Un point en tête (« .gitignore ») n'est pas une extension.
+  return name.lastIndexOf(".") > 0;
+}
+// Windows compare les chemins sans la casse ; les autres plateformes respectent
+// la casse du système de fichiers.
+const IS_WINDOWS = /^win/i.test(navigator.platform);
 
 function element<T extends Element>(selector: string): T {
   const result = document.querySelector<T>(selector);
@@ -60,13 +131,15 @@ const dom = {
   explorerResizer: element<HTMLElement>("#explorer-resizer"),
   closeFolder: element<HTMLButtonElement>("#btn-close-folder"),
   editor: element<HTMLElement>("#editor"),
+  editorStage: element<HTMLElement>("#editor-stage"),
   welcome: element<HTMLElement>("#welcome"),
   tabs: element<HTMLElement>("#tabs"),
   previewPanel: element<HTMLElement>("#preview-panel"),
   previewResizer: element<HTMLElement>("#preview-resizer"),
   previewFrame: element<HTMLIFrameElement>("#preview-frame"),
   previewEmpty: element<HTMLElement>("#preview-empty"),
-  previewPath: element<HTMLElement>("#preview-path"),
+  previewUrl: element<HTMLInputElement>("#preview-url"),
+  previewForm: element<HTMLFormElement>("#preview-form"),
   previewRoute: element<HTMLElement>("#preview-route"),
   searchPanel: element<HTMLElement>("#search-panel"),
   searchQuery: element<HTMLInputElement>("#search-query"),
@@ -89,6 +162,8 @@ const dom = {
   recentMenu: element<HTMLElement>("#recent-menu"),
   fileMenuTrigger: element<HTMLButtonElement>("#menu-file-trigger"),
   fileMenu: element<HTMLElement>("#menu-file"),
+  editMenuTrigger: element<HTMLButtonElement>("#menu-edit-trigger"),
+  editMenu: element<HTMLElement>("#menu-edit"),
   themeToggle: element<HTMLButtonElement>("#theme-toggle"),
   themeIcon: element<HTMLElement>("#theme-icon"),
   statusState: element<HTMLElement>("#status-state"),
@@ -96,8 +171,11 @@ const dom = {
   statusPosition: element<HTMLElement>("#status-position"),
   languageSelect: element<HTMLSelectElement>("#language-select"),
   confirmDialog: element<HTMLDialogElement>("#confirm-dialog"),
+  confirmTitle: element<HTMLElement>("#confirm-title"),
   confirmDescription: element<HTMLElement>("#confirm-description"),
   confirmCancel: element<HTMLButtonElement>("#confirm-cancel"),
+  confirmAccept: element<HTMLButtonElement>("#confirm-accept"),
+  editorContextMenu: element<HTMLElement>("#editor-context-menu"),
   toastRegion: element<HTMLElement>("#toast-region"),
 };
 
@@ -192,11 +270,20 @@ const codeEditor = monaco.editor.create(dom.editor, {
   insertSpaces: true,
   autoIndent: "full",
   formatOnPaste: true,
+  contextmenu: false,
   find: {
     seedSearchStringFromSelection: "always",
     autoFindInSelection: "never",
   },
 });
+
+if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  codeEditor.updateOptions({
+    smoothScrolling: false,
+    cursorSmoothCaretAnimation: "off",
+    cursorBlinking: "solid",
+  });
+}
 
 let documents: OpenDocument[] = [];
 let activeDocumentId: string | null = null;
@@ -208,11 +295,42 @@ let fileMatches: monaco.editor.FindMatch[] = [];
 let activeMatchIndex = -1;
 let folderSearchGeneration = 0;
 let searchTimer: number | undefined;
+let searchPanelPlaced = false;
 let isComposingSearch = false;
 let previewVisible = false;
 let explorerVisible = true;
-let allowWindowClose = false;
+let browserTarget: BrowserTarget | null = null;
+let remotePageLoaded = false;
+let windowClosePending = false;
 let untitledCounter = 1;
+let sessionReady = false;
+let projectSourceLibraries: monaco.IDisposable[] = [];
+let projectContextGeneration = 0;
+
+const sharedTypeScriptOptions: monaco.languages.typescript.CompilerOptions = {
+  allowJs: true,
+  allowNonTsExtensions: true,
+  checkJs: true,
+  esModuleInterop: true,
+  jsx: monaco.languages.typescript.JsxEmit.ReactJSX,
+  module: monaco.languages.typescript.ModuleKind.ESNext,
+  moduleResolution: monaco.languages.typescript.ModuleResolutionKind.NodeJs,
+  resolveJsonModule: true,
+  target: monaco.languages.typescript.ScriptTarget.ES2020,
+};
+
+for (const defaults of [
+  monaco.languages.typescript.typescriptDefaults,
+  monaco.languages.typescript.javascriptDefaults,
+]) {
+  defaults.setEagerModelSync(true);
+  defaults.setDiagnosticsOptions({
+    noSemanticValidation: false,
+    noSyntaxValidation: false,
+    diagnosticCodesToIgnore: TYPESCRIPT_IMPORT_DIAGNOSTICS_TO_IGNORE,
+  });
+  defaults.setCompilerOptions(sharedTypeScriptOptions);
+}
 
 function activeDocument(): OpenDocument | undefined {
   return documents.find((document) => document.id === activeDocumentId);
@@ -236,14 +354,176 @@ function guessLanguageFromPath(path: string): string {
   return "plaintext";
 }
 
+function normalizePath(path: string): string {
+  const unified = path.replace(/\\/g, "/");
+  return IS_WINDOWS ? unified.toLocaleLowerCase() : unified;
+}
+
+// Le dialogue Windows retourne des chemins verbatim « \\?\C:\… » : sans
+// normalisation, le même fichier peut s'ouvrir dans deux onglets.
+function normalizeDialogPath(path: string): string {
+  return path.replace(/^\\\\\?\\/, "");
+}
+
 function pathEquals(left: string, right: string): boolean {
-  return left.replace(/\\/g, "/").toLocaleLowerCase() === right.replace(/\\/g, "/").toLocaleLowerCase();
+  return normalizePath(left) === normalizePath(right);
 }
 
 function isPathWithin(path: string, root: string): boolean {
-  const normalizedPath = path.replace(/\\/g, "/").toLocaleLowerCase();
-  const normalizedRoot = root.replace(/\\/g, "/").replace(/\/$/, "").toLocaleLowerCase();
+  const normalizedPath = normalizePath(path);
+  const normalizedRoot = normalizePath(root).replace(/\/$/, "");
   return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+function joinPath(root: string, child: string): string {
+  const separator = root.includes("\\") ? "\\" : "/";
+  return `${root.replace(/[\\/]$/, "")}${separator}${child}`;
+}
+
+function isAbsoluteBasePath(value: string): boolean {
+  return value.startsWith("/") || value.startsWith("\\\\") || /^[a-zA-Z]:[\\/]/.test(value);
+}
+
+function resolveBasePath(root: string, base: string): string {
+  return isAbsoluteBasePath(base) ? base : joinPath(root, base);
+}
+
+function stripTrailingCommas(source: string): string {
+  let result = "";
+  let inString = false;
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const current = source[index];
+    if (inString) {
+      result += current;
+      if (escaped) escaped = false;
+      else if (current === "\\") escaped = true;
+      else if (current === quote) inString = false;
+      continue;
+    }
+    if (current === '"' || current === "'") {
+      inString = true;
+      quote = current;
+      result += current;
+      continue;
+    }
+    if (current === ",") {
+      let lookahead = index + 1;
+      while (lookahead < source.length && /\s/.test(source[lookahead])) lookahead += 1;
+      const next = source[lookahead];
+      if (next === "}" || next === "]") continue;
+    }
+    result += current;
+  }
+  return result;
+}
+
+function stripJsonComments(source: string): string {
+  let result = "";
+  let inString = false;
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const current = source[index];
+    const next = source[index + 1];
+    if (inString) {
+      result += current;
+      if (escaped) escaped = false;
+      else if (current === "\\") escaped = true;
+      else if (current === quote) inString = false;
+      continue;
+    }
+    if (current === '"' || current === "'") {
+      inString = true;
+      quote = current;
+      result += current;
+      continue;
+    }
+    if (current === "/" && next === "/") {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      result += "\n";
+      continue;
+    }
+    if (current === "/" && next === "*") {
+      index += 2;
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) index += 1;
+      index += 1;
+      continue;
+    }
+    result += current;
+  }
+  // Le retrait des virgules traînantes connaît l'état des chaînes pour ne pas
+  // corrompre une valeur contenant «,} » ou «,] ».
+  return stripTrailingCommas(result);
+}
+
+async function readProjectCompilerOptions(root: string): Promise<monaco.languages.typescript.CompilerOptions> {
+  for (const name of ["tsconfig.json", "jsconfig.json"]) {
+    try {
+      const content = await invoke<FileContent>("read_file", { path: joinPath(root, name) });
+      const config = JSON.parse(stripJsonComments(content.contents)) as {
+        compilerOptions?: { baseUrl?: unknown; paths?: unknown };
+      };
+      const configured = config.compilerOptions ?? {};
+      const baseUrl = typeof configured.baseUrl === "string" ? configured.baseUrl : ".";
+      const paths = configured.paths && typeof configured.paths === "object"
+        ? configured.paths as Record<string, string[]>
+        : undefined;
+      return {
+        ...sharedTypeScriptOptions,
+        baseUrl: monaco.Uri.file(resolveBasePath(root, baseUrl)).toString(),
+        paths,
+      };
+    } catch {
+      // Try the other standard project configuration, then use safe defaults.
+    }
+  }
+  return {
+    ...sharedTypeScriptOptions,
+    baseUrl: monaco.Uri.file(root).toString(),
+    paths: { "@/*": ["*"] },
+  };
+}
+
+function clearProjectLanguageContext(): void {
+  projectContextGeneration += 1;
+  projectSourceLibraries.forEach((library) => library.dispose());
+  projectSourceLibraries = [];
+  monaco.languages.typescript.typescriptDefaults.setCompilerOptions(sharedTypeScriptOptions);
+  monaco.languages.typescript.javascriptDefaults.setCompilerOptions(sharedTypeScriptOptions);
+}
+
+async function refreshProjectLanguageContext(root: string): Promise<void> {
+  const generation = ++projectContextGeneration;
+  projectSourceLibraries.forEach((library) => library.dispose());
+  projectSourceLibraries = [];
+  try {
+    const [sources, compilerOptions] = await Promise.all([
+      invoke<ProjectSourceFile[]>("index_project_sources", { root }),
+      readProjectCompilerOptions(root),
+    ]);
+    if (generation !== projectContextGeneration || !workspaceRoot || !pathEquals(workspaceRoot.path, root)) return;
+    for (const defaults of [
+      monaco.languages.typescript.typescriptDefaults,
+      monaco.languages.typescript.javascriptDefaults,
+    ]) defaults.setCompilerOptions(compilerOptions);
+    projectSourceLibraries = sources.flatMap((source) => {
+      const uri = monaco.Uri.file(source.path).toString();
+      return [
+        monaco.languages.typescript.typescriptDefaults.addExtraLib(source.contents, uri),
+        monaco.languages.typescript.javascriptDefaults.addExtraLib(source.contents, uri),
+      ];
+    });
+    renderStatus();
+    if (sources.length > 0) {
+      showToast("Imports reconnus", `${sources.length} sources locales indexées.`, "success");
+    }
+  } catch (error) {
+    if (generation !== projectContextGeneration) return;
+    renderStatus();
+    showToast("Analyse du projet limitée", errorMessage(error), "info");
+  }
 }
 
 function fileGlyph(language: string): HTMLElement {
@@ -332,8 +612,13 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-async function confirmDiscard(description: string): Promise<boolean> {
+async function confirmAction(title: string, description: string, acceptLabel: string): Promise<boolean> {
+  // Un dialogue modal est déjà ouvert : refuser sans lever, sinon showModal()
+  // provoquerait une InvalidStateError.
+  if (dom.confirmDialog.open) return false;
+  dom.confirmTitle.textContent = title;
   dom.confirmDescription.textContent = description;
+  dom.confirmAccept.textContent = acceptLabel;
   dom.confirmDialog.showModal();
   window.setTimeout(() => dom.confirmCancel.focus(), 0);
   return new Promise((resolve) => {
@@ -345,13 +630,16 @@ async function confirmDiscard(description: string): Promise<boolean> {
   });
 }
 
-function createDocument(name: string, path: string | null, contents: string, language: string): OpenDocument {
-  const uri = path
-    ? monaco.Uri.parse(`file:///${path.replace(/\\/g, "/")}`)
-    : monaco.Uri.parse(`untitled:///Nouveau-${untitledCounter}`);
-  const model = monaco.editor.createModel(contents, language, uri);
-  let documentRecord: OpenDocument;
-  const disposeChangeListener = model.onDidChangeContent(() => {
+function confirmDiscard(description: string): Promise<boolean> {
+  return confirmAction(
+    "Modifications non enregistrées",
+    description,
+    "Fermer sans enregistrer",
+  );
+}
+
+function watchDocument(documentRecord: OpenDocument): monaco.IDisposable {
+  return documentRecord.model.onDidChangeContent(() => {
     if (documentRecord.suppressDirty) return;
     if (!documentRecord.dirty) {
       documentRecord.dirty = true;
@@ -360,7 +648,24 @@ function createDocument(name: string, path: string | null, contents: string, lan
       void updateWindowTitle();
     }
   });
-  documentRecord = {
+}
+
+const noopDisposable: monaco.IDisposable = { dispose() {} };
+
+function createDocument(
+  name: string,
+  path: string | null,
+  contents: string,
+  language: string,
+  modified = 0,
+): OpenDocument {
+  const uri = path
+    ? monaco.Uri.file(path)
+    : monaco.Uri.parse(`untitled:///Nouveau-${untitledCounter}`);
+  const model = monaco.editor.createModel(contents, language, uri);
+  // L'écouteur est rattaché juste après la création : aucune édition ne peut
+  // intervenir dans ce même tour synchrone.
+  const documentRecord: OpenDocument = {
     id: crypto.randomUUID(),
     name,
     path,
@@ -368,9 +673,29 @@ function createDocument(name: string, path: string | null, contents: string, lan
     model,
     dirty: false,
     suppressDirty: false,
-    disposeChangeListener,
+    modified,
+    disposeChangeListener: noopDisposable,
   };
+  documentRecord.disposeChangeListener = watchDocument(documentRecord);
   return documentRecord;
+}
+
+function renameDocumentModel(documentRecord: OpenDocument, newPath: string): void {
+  const wasActive = documentRecord.id === activeDocumentId;
+  const viewState = wasActive ? codeEditor.saveViewState() : null;
+  const replacement = monaco.editor.createModel(
+    documentRecord.model.getValue(),
+    documentRecord.language,
+    monaco.Uri.file(newPath),
+  );
+  if (wasActive) {
+    codeEditor.setModel(replacement);
+    if (viewState) codeEditor.restoreViewState(viewState);
+  }
+  documentRecord.disposeChangeListener.dispose();
+  documentRecord.model.dispose();
+  documentRecord.model = replacement;
+  documentRecord.disposeChangeListener = watchDocument(documentRecord);
 }
 
 async function updateWindowTitle(): Promise<void> {
@@ -533,6 +858,62 @@ function refreshChrome(): void {
   renderStatus();
   updatePreviewAvailability();
   void updateWindowTitle();
+  if (sessionReady) saveSessionSnapshot();
+}
+
+interface SessionSnapshot {
+  workspace: string | null;
+  paths: string[];
+  activePath: string | null;
+}
+
+function saveSessionSnapshot(): void {
+  try {
+    const snapshot: SessionSnapshot = {
+      workspace: workspaceRoot?.path ?? null,
+      paths: documents.filter((document) => document.path).map((document) => document.path as string),
+      activePath: activeDocument()?.path ?? null,
+    };
+    sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Stockage indisponible : la session ne sera simplement pas restaurée.
+  }
+}
+
+async function restoreSessionAfterReload(): Promise<void> {
+  let snapshot: SessionSnapshot | null = null;
+  try {
+    const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    if (raw) snapshot = JSON.parse(raw) as SessionSnapshot;
+  } catch {
+    snapshot = null;
+  }
+  if (snapshot?.paths?.length || snapshot?.workspace) {
+    let restored = 0;
+    if (snapshot.workspace) {
+      await openFolderPath(normalizeDialogPath(snapshot.workspace), true);
+    }
+    for (const path of snapshot.paths) {
+      const before = documents.length;
+      await openFilePath(normalizeDialogPath(path), undefined, undefined, true);
+      if (documents.length > before) restored += 1;
+    }
+    const activePath = snapshot.activePath ? normalizeDialogPath(snapshot.activePath) : null;
+    const activeDoc = activePath
+      ? documents.find((document) => document.path && pathEquals(document.path, activePath))
+      : undefined;
+    if (activeDoc) switchDocument(activeDoc.id);
+    if (restored > 0 || workspaceRoot) {
+      showToast(
+        "Session restaurée",
+        `${restored} fichier${restored > 1 ? "s" : ""} et le dossier ont été rouverts après le rechargement de la page.`,
+        "info",
+      );
+    }
+  }
+  sessionReady = true;
+  saveSessionSnapshot();
 }
 
 function switchDocument(id: string, line?: number, column?: number): void {
@@ -560,24 +941,20 @@ function newFile(): void {
 async function chooseFile(): Promise<void> {
   const selected = await open({
     multiple: false,
-    filters: [
-      {
-        name: "Code et texte",
-        extensions: [
-          "html", "htm", "css", "scss", "less", "js", "mjs", "cjs", "ts", "tsx", "jsx", "json",
-          "md", "txt", "xml", "yaml", "yml", "php", "py", "rs", "go", "java", "kt", "dart", "sql",
-          "sh", "ps1", "c", "h", "cpp", "hpp", "cs", "swift", "vue", "svelte",
-        ],
-      },
-      { name: "Tous les fichiers", extensions: ["*"] },
-    ],
+    filters: FILE_TYPE_FILTERS,
   });
   if (!selected || Array.isArray(selected)) return;
-  await openFilePath(selected);
+  await openFilePath(normalizeDialogPath(selected));
 }
 
-async function openFilePath(path: string, line?: number, column?: number): Promise<void> {
-  const existing = documents.find((document) => document.path && pathEquals(document.path, path));
+async function openFilePath(
+  path: string,
+  line?: number,
+  column?: number,
+  silent = false,
+): Promise<void> {
+  const normalizedPath = normalizeDialogPath(path);
+  const existing = documents.find((document) => document.path && pathEquals(document.path, normalizedPath));
   if (existing) {
     switchDocument(existing.id, line, column);
     return;
@@ -585,52 +962,118 @@ async function openFilePath(path: string, line?: number, column?: number): Promi
 
   try {
     dom.statusState.textContent = "Ouverture…";
-    const contents = await invoke<string>("read_file", { path });
-    const language = guessLanguageFromPath(path);
-    const documentRecord = createDocument(fileNameFromPath(path), path, contents, language);
+    const content = await invoke<FileContent>("read_file", { path: normalizedPath });
+    const language = guessLanguageFromPath(normalizedPath);
+    const documentRecord = createDocument(
+      fileNameFromPath(normalizedPath),
+      normalizedPath,
+      content.contents,
+      language,
+      content.modified,
+    );
     documents.push(documentRecord);
-    recents = rememberRecent("file", path, documentRecord.name);
+    recents = rememberRecent("file", normalizedPath, documentRecord.name);
     switchDocument(documentRecord.id, line, column);
-    if (HTML_EXTENSIONS.has(extensionFromPath(path))) {
+    if (HTML_EXTENSIONS.has(extensionFromPath(normalizedPath))) {
       setPreviewVisible(true);
       await refreshPreview(false);
     }
   } catch (error) {
-    recents = removeRecent(path);
+    recents = removeRecent(normalizedPath);
     refreshChrome();
-    showToast("Fichier non ouvert", `${fileNameFromPath(path)} : ${errorMessage(error)}`, "error");
+    if (!silent) {
+      showToast("Fichier non ouvert", `${fileNameFromPath(normalizedPath)} : ${errorMessage(error)}`, "error");
+    }
+  }
+}
+
+let projectContextRefreshTimer: number | undefined;
+
+function scheduleProjectContextRefresh(path: string): void {
+  if (!workspaceRoot || !isPathWithin(path, workspaceRoot.path)) return;
+  window.clearTimeout(projectContextRefreshTimer);
+  projectContextRefreshTimer = window.setTimeout(() => {
+    if (workspaceRoot) void refreshProjectLanguageContext(workspaceRoot.path);
+  }, 1500);
+}
+
+async function persistDocument(
+  documentRecord: OpenDocument,
+  target: string,
+  expectedModified: number,
+): Promise<boolean> {
+  const isNewTarget = !documentRecord.path || !pathEquals(documentRecord.path, target);
+  try {
+    const modified = await invoke<number>("write_file", {
+      path: target,
+      contents: documentRecord.model.getValue(),
+      expectedModified,
+    });
+    if (isNewTarget) renameDocumentModel(documentRecord, target);
+    documentRecord.path = target;
+    documentRecord.name = fileNameFromPath(target);
+    documentRecord.language = guessLanguageFromPath(target);
+    monaco.editor.setModelLanguage(documentRecord.model, documentRecord.language);
+    documentRecord.modified = modified;
+    documentRecord.dirty = false;
+    recents = rememberRecent("file", target, documentRecord.name);
+    refreshChrome();
+    showToast("Enregistré", documentRecord.name, "success");
+    scheduleProjectContextRefresh(target);
+    return true;
+  } catch (error) {
+    const message = errorMessage(error);
+    if (message.startsWith(MODIFIED_EXTERNALLY_PREFIX)) {
+      const overwrite = await confirmAction(
+        "Fichier modifié en dehors de l’application",
+        `« ${documentRecord.name} » a été modifié par une autre application depuis son ouverture. Enregistrer remplacera cette version externe.`,
+        "Écraser le fichier",
+      );
+      if (overwrite) return persistDocument(documentRecord, target, 0);
+      renderStatus();
+      return false;
+    }
+    renderStatus();
+    showToast("Enregistrement impossible", `${documentRecord.name} : ${message}`, "error");
+    return false;
   }
 }
 
 async function saveDocument(documentRecord = activeDocument(), saveAs = false): Promise<boolean> {
   if (!documentRecord) return false;
   let target = documentRecord.path;
+  let expectedModified = documentRecord.modified;
   if (!target || saveAs) {
     const selected = await save({
-      defaultPath: target ?? `${documentRecord.name}.txt`,
-      filters: [{ name: "Tous les fichiers", extensions: ["*"] }],
+      defaultPath: target ?? `${documentRecord.name}${defaultExtensionForLanguage(documentRecord.language)}`,
+      filters: FILE_TYPE_FILTERS,
     });
     if (!selected) return false;
-    target = selected;
+    const chosen = normalizeDialogPath(selected);
+    // Un document sans nom enregistré sans extension reçoit celle de son
+    // langage (« Nouveau-1 » → « Nouveau-1.txt ») pour éviter les fichiers
+    // sans type ; un nom déjà typé est respecté tel quel.
+    target = !documentRecord.path && !fileNameHasExtension(chosen)
+      ? `${chosen}${defaultExtensionForLanguage(documentRecord.language)}`
+      : chosen;
+    if (!documentRecord.path || !pathEquals(documentRecord.path, chosen)) {
+      const occupant = documents.find(
+        (document) => document !== documentRecord && document.path && pathEquals(document.path, chosen),
+      );
+      if (occupant) {
+        showToast(
+          "Enregistrement impossible",
+          `« ${occupant.name} » est déjà ouvert dans un autre onglet.`,
+          "error",
+        );
+        return false;
+      }
+    }
+    // Nouvelle destination : pas de contrôle de fraîcheur à opposer.
+    expectedModified = 0;
   }
-
-  try {
-    dom.statusState.textContent = "Enregistrement…";
-    await invoke("write_file", { path: target, contents: documentRecord.model.getValue() });
-    documentRecord.path = target;
-    documentRecord.name = fileNameFromPath(target);
-    documentRecord.language = guessLanguageFromPath(target);
-    monaco.editor.setModelLanguage(documentRecord.model, documentRecord.language);
-    documentRecord.dirty = false;
-    recents = rememberRecent("file", target, documentRecord.name);
-    refreshChrome();
-    showToast("Enregistré", documentRecord.name, "success");
-    return true;
-  } catch (error) {
-    renderStatus();
-    showToast("Enregistrement impossible", `${documentRecord.name} : ${errorMessage(error)}`, "error");
-    return false;
-  }
+  dom.statusState.textContent = "Enregistrement…";
+  return persistDocument(documentRecord, target, expectedModified);
 }
 
 function disposeDocument(documentRecord: OpenDocument): void {
@@ -664,32 +1107,37 @@ async function closeDocument(id: string, skipConfirmation = false): Promise<bool
 async function openFolder(): Promise<void> {
   const selected = await open({ directory: true, multiple: false });
   if (!selected || Array.isArray(selected)) return;
-  await openFolderPath(selected);
+  await openFolderPath(normalizeDialogPath(selected));
 }
 
-async function openFolderPath(path: string): Promise<void> {
-  if (workspaceRoot && pathEquals(workspaceRoot.path, path)) return;
+async function openFolderPath(path: string, silent = false): Promise<void> {
+  const normalizedPath = normalizeDialogPath(path);
+  if (workspaceRoot && pathEquals(workspaceRoot.path, normalizedPath)) return;
   if (workspaceRoot && !(await closeWorkspace(true))) return;
 
   try {
     dom.statusState.textContent = "Lecture du dossier…";
-    const children = await invoke<FileEntry[]>("list_directory", { path });
+    const listing = await invoke<DirectoryListing>("list_directory", { path: normalizedPath });
     workspaceRoot = {
-      name: fileNameFromPath(path),
-      path,
+      name: fileNameFromPath(normalizedPath),
+      path: normalizedPath,
       isDirectory: true,
       isSymlink: false,
       expanded: true,
-      children: children.map(toTreeNode),
+      children: listing.entries.map(toTreeNode),
+      truncated: listing.truncated,
     };
-    recents = rememberRecent("folder", path, workspaceRoot.name);
+    recents = rememberRecent("folder", normalizedPath, workspaceRoot.name);
     refreshChrome();
-    showToast("Dossier ouvert", workspaceRoot.name, "success");
+    if (!silent) showToast("Dossier ouvert", workspaceRoot.name, "success");
+    void refreshProjectLanguageContext(normalizedPath);
   } catch (error) {
-    recents = removeRecent(path);
+    recents = removeRecent(normalizedPath);
     workspaceRoot = null;
     refreshChrome();
-    showToast("Dossier non ouvert", `${fileNameFromPath(path)} : ${errorMessage(error)}`, "error");
+    if (!silent) {
+      showToast("Dossier non ouvert", `${fileNameFromPath(normalizedPath)} : ${errorMessage(error)}`, "error");
+    }
   }
 }
 
@@ -709,8 +1157,9 @@ async function toggleFolderNode(node: TreeNode): Promise<void> {
     node.loading = true;
     renderExplorer();
     try {
-      const children = await invoke<FileEntry[]>("list_directory", { path: node.path });
-      node.children = children.map(toTreeNode);
+      const listing = await invoke<DirectoryListing>("list_directory", { path: node.path });
+      node.children = listing.entries.map(toTreeNode);
+      node.truncated = listing.truncated;
     } catch (error) {
       node.expanded = false;
       showToast("Dossier illisible", `${node.name} : ${errorMessage(error)}`, "error");
@@ -762,6 +1211,12 @@ function renderTree(nodes: TreeNode[]): HTMLUListElement {
     if (node.isDirectory && node.expanded && node.children) {
       const children = renderTree(node.children);
       children.classList.add("tree-children");
+      if (node.truncated) {
+        const notice = document.createElement("li");
+        notice.className = "tree-truncated";
+        notice.textContent = `Liste tronquée : ${node.children.length} premiers éléments affichés.`;
+        children.append(notice);
+      }
       item.append(children);
     }
     list.append(item);
@@ -808,6 +1263,7 @@ async function closeWorkspace(replacing = false): Promise<boolean> {
     await closeDocument(documentRecord.id, true);
   }
   workspaceRoot = null;
+  clearProjectLanguageContext();
   searchScope = "file";
   refreshChrome();
   return true;
@@ -878,8 +1334,11 @@ function toggleMenu(trigger: HTMLButtonElement, menu: HTMLElement): void {
 
 function closeMenus(): void {
   dom.fileMenu.hidden = true;
+  dom.editMenu.hidden = true;
   dom.recentMenu.hidden = true;
+  dom.editorContextMenu.hidden = true;
   dom.fileMenuTrigger.setAttribute("aria-expanded", "false");
+  dom.editMenuTrigger.setAttribute("aria-expanded", "false");
   dom.recentTrigger.setAttribute("aria-expanded", "false");
 }
 
@@ -894,48 +1353,305 @@ function setPreviewVisible(visible: boolean): void {
   dom.previewPanel.hidden = !visible;
   dom.previewResizer.hidden = !visible;
   element<HTMLButtonElement>("#btn-toggle-preview").setAttribute("aria-pressed", String(visible));
+  if (!visible && browserTarget?.kind === "remote") {
+    // Fermer le navigateur arrête la page distante (scripts, téléchargements).
+    dom.previewFrame.removeAttribute("src");
+    remotePageLoaded = false;
+  }
   window.setTimeout(() => codeEditor.layout(), 0);
   updatePreviewAvailability();
 }
 
 function updatePreviewAvailability(): void {
-  const available = isHtmlDocument();
-  dom.previewRoute.classList.toggle("is-active", previewVisible && available);
+  const remoteShown = browserTarget?.kind === "remote";
+  dom.previewRoute.classList.toggle(
+    "is-active",
+    previewVisible && (isHtmlDocument() || remoteShown),
+  );
   if (!previewVisible) return;
-  if (!available) {
+  if (!isHtmlDocument() && !remoteShown) {
     dom.previewFrame.hidden = true;
     dom.previewFrame.removeAttribute("src");
+    remotePageLoaded = false;
     dom.previewEmpty.hidden = false;
-    dom.previewPath.textContent = "Sélectionnez un fichier HTML enregistré";
+    dom.previewUrl.value = "";
   }
+}
+
+function addressForBrowserTarget(): string {
+  if (!browserTarget) return "";
+  return browserTarget.kind === "remote" ? browserTarget.url : browserTarget.path;
+}
+
+function fileUrlToPath(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "file:") return null;
+    let pathname = decodeURIComponent(parsed.pathname);
+    if (/^\/[a-zA-Z]:/.test(pathname)) pathname = pathname.slice(1);
+    return pathname.replace(/\//g, "\\");
+  } catch {
+    return null;
+  }
+}
+
+const LOCAL_ADDRESS_PATTERN = new RegExp(
+  [
+    "localhost(?::\\d{1,5})?(?:/[^\\s]*)?",
+    "127(?:\\.\\d{1,3}){3}(?::\\d{1,5})?(?:/[^\\s]*)?",
+    "192\\.168(?:\\.\\d{1,3}){2}(?::\\d{1,5})?(?:/[^\\s]*)?",
+    "10(?:\\.\\d{1,3}){3}(?::\\d{1,5})?(?:/[^\\s]*)?",
+    "172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2}(?::\\d{1,5})?(?:/[^\\s]*)?",
+    "\\[::1\\](?::\\d{1,5})?(?:/[^\\s]*)?",
+    "[a-z0-9-]+\\.localhost(?::\\d{1,5})?(?:/[^\\s]*)?",
+  ].join("|"),
+  "i",
+);
+const DOMAIN_ADDRESS_PATTERN = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d{1,5})?(?:\/[^\s]*)?$/i;
+
+function relativeBaseDirectory(): string | null {
+  if (workspaceRoot) return workspaceRoot.path;
+  const currentPath = activeDocument()?.path;
+  return currentPath ? parentDirectory(currentPath) : null;
+}
+
+function parentDirectory(path: string): string {
+  const normalized = path.replace(/[\\/]+$/, "");
+  const cut = Math.max(normalized.lastIndexOf("\\"), normalized.lastIndexOf("/"));
+  return cut > 0 ? normalized.slice(0, cut) : normalized;
+}
+
+async function showRemotePage(url: string): Promise<void> {
+  setPreviewVisible(true);
+  browserTarget = { kind: "remote", url };
+  try {
+    // Libère le dossier servi par le protocole local : une page distante ne doit
+    // pas pouvoir relire les fichiers de l'aperçu via codenotepad.localhost.
+    await invoke("clear_preview");
+  } catch {
+    // Sans libération, la navigation distante reste prioritaire ; l'état local
+    // sera rétabli au prochain aperçu de fichier.
+  }
+  dom.previewFrame.hidden = false;
+  dom.previewEmpty.hidden = true;
+  dom.previewFrame.src = url;
+  dom.previewUrl.value = url;
+  remotePageLoaded = true;
+  dom.previewRoute.classList.add("is-active");
+}
+
+async function resolveAmbiguousAddress(value: string): Promise<BrowserTarget> {
+  // « exemple.com » désigne le plus souvent un domaine, mais peut être un
+  // fichier local homonyme du dossier ouvert : le dossier tranche.
+  const base = relativeBaseDirectory();
+  if (base) {
+    try {
+      const listing = await invoke<DirectoryListing>("list_directory", { path: base });
+      const candidate = joinPath(base, value);
+      if (listing.entries.some((entry) => pathEquals(entry.path, candidate))) {
+        return { kind: "local", path: candidate };
+      }
+    } catch {
+      // Dossier illisible : considérer l'adresse comme distante.
+    }
+  }
+  return { kind: "remote", url: `https://${value}` };
+}
+
+async function navigateBrowser(raw: string): Promise<void> {
+  const value = raw.trim();
+  if (!value) return;
+  if (/^https?:\/\//i.test(value)) {
+    await showRemotePage(value);
+    return;
+  }
+  const fileUrl = /^file:\/\//i.test(value) ? fileUrlToPath(value) : null;
+  if (fileUrl) {
+    await openFilePath(fileUrl);
+    return;
+  }
+  if (/^[a-zA-Z]:[\\/]/.test(value) || value.startsWith("\\\\") || value.startsWith("/")) {
+    await openFilePath(value);
+    return;
+  }
+  if (LOCAL_ADDRESS_PATTERN.test(value)) {
+    await showRemotePage(`http://${value}`);
+    return;
+  }
+  if (DOMAIN_ADDRESS_PATTERN.test(value)) {
+    const target = await resolveAmbiguousAddress(value);
+    if (target.kind === "local") await openFilePath(target.path);
+    else await showRemotePage(target.url);
+    return;
+  }
+  const base = relativeBaseDirectory();
+  if (!base) {
+    showToast("Adresse incomplète", "Indiquez un chemin absolu ou une adresse http(s).", "info");
+    return;
+  }
+  await openFilePath(joinPath(base, value));
 }
 
 async function refreshPreview(saveBefore: boolean): Promise<void> {
   const current = activeDocument();
   if (!isHtmlDocument(current)) {
-    updatePreviewAvailability();
+    if (browserTarget?.kind === "remote" && !remotePageLoaded) await showRemotePage(browserTarget.url);
+    else updatePreviewAvailability();
     return;
   }
   if (saveBefore && current.dirty && !(await saveDocument(current))) return;
 
   try {
-    dom.previewPath.textContent = "Préparation du rendu…";
     const prepared = await invoke<string>("prepare_preview", {
       path: current.path,
       workspaceRoot: workspaceRoot?.path ?? null,
     });
+    browserTarget = { kind: "local", path: current.path };
+    remotePageLoaded = false;
     const separator = prepared.includes("?") ? "&" : "?";
     dom.previewFrame.src = `${prepared}${separator}refresh=${Date.now()}`;
     dom.previewFrame.hidden = false;
     dom.previewEmpty.hidden = true;
-    dom.previewPath.textContent = current.path;
-    dom.previewPath.title = current.path;
+    dom.previewUrl.value = current.path;
     dom.previewRoute.classList.add("is-active");
   } catch (error) {
     dom.previewFrame.hidden = true;
     dom.previewEmpty.hidden = false;
-    dom.previewPath.textContent = "Aperçu indisponible";
+    dom.previewUrl.value = addressForBrowserTarget();
     showToast("Aperçu impossible", errorMessage(error), "error");
+  }
+}
+
+async function writeClipboardText(text: string): Promise<boolean> {
+  if (!text) return true;
+  try {
+    if (isNativeApp) {
+      await writeText(text);
+      return true;
+    }
+  } catch {
+    // Repli sur le presse-papiers du navigateur (mode développement).
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readClipboardText(): Promise<string | null> {
+  try {
+    if (isNativeApp) return await readText();
+  } catch {
+    // Repli sur le presse-papiers du navigateur (mode développement).
+  }
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    return null;
+  }
+}
+
+async function copySelectionToClipboard(cut: boolean): Promise<void> {
+  if (!activeDocument()) return;
+  const selection = codeEditor.getSelection();
+  const model = codeEditor.getModel();
+  if (!selection || !model || selection.isEmpty()) return;
+  const text = model.getValueInRange(selection);
+  if (!(await writeClipboardText(text))) {
+    showToast("Presse-papiers indisponible", "L’autorisation de lecture du presse-papiers a été refusée.", "error");
+    return;
+  }
+  if (cut) {
+    codeEditor.executeEdits("menu-edit", [{ range: selection, text: "", forceMoveMarkers: true }]);
+  }
+}
+
+async function pasteFromClipboard(): Promise<void> {
+  if (!activeDocument()) return;
+  const text = await readClipboardText();
+  if (text === null) {
+    showToast("Presse-papiers indisponible", "L’autorisation de lecture du presse-papiers a été refusée.", "error");
+    return;
+  }
+  if (!text) return;
+  codeEditor.focus();
+  const selection = codeEditor.getSelection();
+  if (!selection) return;
+  codeEditor.executeEdits("menu-edit", [{ range: selection, text, forceMoveMarkers: true }]);
+}
+
+function selectAllInEditor(): void {
+  const model = codeEditor.getModel();
+  if (!model) return;
+  codeEditor.setSelection(model.getFullModelRange());
+  codeEditor.focus();
+}
+
+function runEditorCommand(command: string): void {
+  if (!activeDocument()) return;
+  codeEditor.focus();
+  codeEditor.trigger("menu-edit", command, null);
+}
+
+function openReplacePanel(): void {
+  openSearchPanel();
+  dom.replaceValue.focus();
+}
+
+function openEditorContextMenu(x: number, y: number): void {
+  closeMenus();
+  dom.editorContextMenu.hidden = false;
+  const width = dom.editorContextMenu.offsetWidth;
+  const height = dom.editorContextMenu.offsetHeight;
+  dom.editorContextMenu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - width - 8))}px`;
+  dom.editorContextMenu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - height - 8))}px`;
+  dom.editorContextMenu.querySelector<HTMLButtonElement>("button:not([disabled])")?.focus();
+}
+
+async function renameActiveDocument(): Promise<void> {
+  const current = activeDocument();
+  if (!current) {
+    showToast("Renommer", "Ouvrez un fichier à renommer.", "info");
+    return;
+  }
+  if (!current.path) {
+    await saveDocument(current, true);
+    return;
+  }
+  const selected = await save({
+    defaultPath: current.path,
+    filters: FILE_TYPE_FILTERS,
+  });
+  if (!selected) return;
+  const target = normalizeDialogPath(selected);
+  if (pathEquals(target, current.path)) return;
+  const occupant = documents.find(
+    (document) => document !== current && document.path && pathEquals(document.path, target),
+  );
+  if (occupant) {
+    showToast("Renommage impossible", `« ${occupant.name} » est déjà ouvert dans un autre onglet.`, "error");
+    return;
+  }
+  const previousPath = current.path;
+  try {
+    dom.statusState.textContent = "Renommage…";
+    const modified = await invoke<number>("rename_file", { source: previousPath, target });
+    renameDocumentModel(current, target);
+    current.path = target;
+    current.name = fileNameFromPath(target);
+    current.language = guessLanguageFromPath(target);
+    monaco.editor.setModelLanguage(current.model, current.language);
+    current.modified = modified;
+    recents = removeRecent(previousPath);
+    recents = rememberRecent("file", target, current.name);
+    refreshChrome();
+    showToast("Renommé", `${fileNameFromPath(previousPath)} → ${current.name}`, "success");
+    scheduleProjectContextRefresh(target);
+  } catch (error) {
+    renderStatus();
+    showToast("Renommage impossible", `${fileNameFromPath(previousPath)} : ${errorMessage(error)}`, "error");
   }
 }
 
@@ -970,6 +1686,7 @@ function updateSearchControls(): void {
 
 function openSearchPanel(): void {
   dom.searchPanel.hidden = false;
+  placeSearchPanelInitially();
   const selection = codeEditor.getSelection();
   const selectedText = selection && !selection.isEmpty() ? codeEditor.getModel()?.getValueInRange(selection) : "";
   if (selectedText && !selectedText.includes("\n")) dom.searchQuery.value = selectedText;
@@ -1175,6 +1892,112 @@ function makeResizable(
   });
 }
 
+function viewportBounds(): DOMRect {
+  return new DOMRect(0, 0, window.innerWidth, window.innerHeight);
+}
+
+function clampTo(
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+  bounds: DOMRect,
+): { left: number; top: number } {
+  return {
+    left: Math.max(0, Math.min(left, Math.max(0, bounds.width - width))),
+    top: Math.max(0, Math.min(top, Math.max(0, bounds.height - height))),
+  };
+}
+
+function anchorTopLeft(): { bounds: DOMRect; left: number; top: number } {
+  const bounds = viewportBounds();
+  const rect = dom.searchPanel.getBoundingClientRect();
+  dom.searchPanel.style.right = "auto";
+  dom.searchPanel.style.left = `${rect.left}px`;
+  dom.searchPanel.style.top = `${rect.top}px`;
+  return { bounds, left: rect.left, top: rect.top };
+}
+
+function placeSearchPanelInitially(): void {
+  if (searchPanelPlaced) return;
+  const stage = dom.editorStage.getBoundingClientRect();
+  const panel = dom.searchPanel.getBoundingClientRect();
+  const next = clampTo(stage.right - panel.width - 18, stage.top + 14, panel.width, panel.height, viewportBounds());
+  dom.searchPanel.style.right = "auto";
+  dom.searchPanel.style.left = `${next.left}px`;
+  dom.searchPanel.style.top = `${next.top}px`;
+  searchPanelPlaced = true;
+}
+
+function setupSearchPanelDrag(): void {
+  const titlebar = dom.searchPanel.querySelector<HTMLElement>(".search-titlebar");
+  if (!titlebar) return;
+  titlebar.tabIndex = 0;
+  titlebar.setAttribute("aria-label", "Déplacer le panneau de recherche (glisser ou flèches du clavier)");
+
+  titlebar.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    if (event.target instanceof Element && event.target.closest("button")) return;
+    event.preventDefault();
+    const rect = dom.searchPanel.getBoundingClientRect();
+    const { bounds, left: baseLeft, top: baseTop } = anchorTopLeft();
+    dom.searchPanel.classList.add("is-dragged");
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const move = (moveEvent: PointerEvent): void => {
+      const next = clampTo(
+        baseLeft + moveEvent.clientX - startX,
+        baseTop + moveEvent.clientY - startY,
+        rect.width,
+        rect.height,
+        bounds,
+      );
+      dom.searchPanel.style.left = `${next.left}px`;
+      dom.searchPanel.style.top = `${next.top}px`;
+    };
+    const stop = (): void => {
+      dom.searchPanel.classList.remove("is-dragged");
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      codeEditor.layout();
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  });
+
+  titlebar.addEventListener("keydown", (event) => {
+    const steps: Record<string, [number, number]> = {
+      ArrowLeft: [-16, 0],
+      ArrowRight: [16, 0],
+      ArrowUp: [0, -16],
+      ArrowDown: [0, 16],
+    };
+    const step = steps[event.key];
+    if (!step) return;
+    event.preventDefault();
+    const rect = dom.searchPanel.getBoundingClientRect();
+    const { bounds } = anchorTopLeft();
+    const next = clampTo(
+      parseFloat(dom.searchPanel.style.left) + step[0],
+      parseFloat(dom.searchPanel.style.top) + step[1],
+      rect.width,
+      rect.height,
+      bounds,
+    );
+    dom.searchPanel.style.left = `${next.left}px`;
+    dom.searchPanel.style.top = `${next.top}px`;
+    codeEditor.layout();
+  });
+
+  window.addEventListener("resize", () => {
+    if (dom.searchPanel.hidden || !searchPanelPlaced) return;
+    const rect = dom.searchPanel.getBoundingClientRect();
+    const next = clampTo(rect.left, rect.top, rect.width, rect.height, viewportBounds());
+    dom.searchPanel.style.left = `${next.left}px`;
+    dom.searchPanel.style.top = `${next.top}px`;
+  });
+}
+
 function setupResizers(): void {
   makeResizable(
     dom.explorerResizer,
@@ -1204,7 +2027,7 @@ function setupResizers(): void {
 }
 
 async function requestWindowClose(): Promise<void> {
-  if (!appWindow) return;
+  if (!appWindow || windowClosePending) return;
   const dirty = documents.filter((document) => document.dirty);
   if (dirty.length > 0) {
     const confirmed = await confirmDiscard(
@@ -1212,8 +2035,14 @@ async function requestWindowClose(): Promise<void> {
     );
     if (!confirmed) return;
   }
-  allowWindowClose = true;
-  await appWindow.close();
+  windowClosePending = true;
+  try {
+    // destroy() bypasses a second close-request event after our own confirmation.
+    await appWindow.destroy();
+  } catch (error) {
+    windowClosePending = false;
+    showToast("Fermeture impossible", errorMessage(error), "error");
+  }
 }
 
 function registerActions(): void {
@@ -1233,8 +2062,18 @@ function registerActions(): void {
     if (previewVisible) void refreshPreview(false);
   });
   element<HTMLButtonElement>("#preview-close").addEventListener("click", () => setPreviewVisible(false));
-  element<HTMLButtonElement>("#preview-refresh").addEventListener("click", () => void refreshPreview(true));
+  element<HTMLButtonElement>("#preview-refresh").addEventListener("click", () => {
+    if (browserTarget?.kind === "remote") {
+      dom.previewFrame.src = browserTarget.url;
+      return;
+    }
+    void refreshPreview(true);
+  });
   element<HTMLButtonElement>("#preview-external").addEventListener("click", () => {
+    if (browserTarget?.kind === "remote") {
+      void openUrl(browserTarget.url);
+      return;
+    }
     const current = activeDocument();
     if (current?.path && isHtmlDocument(current)) void openPath(current.path);
   });
@@ -1242,6 +2081,7 @@ function registerActions(): void {
 
   dom.themeToggle.addEventListener("click", () => applyTheme(activeTheme === "light" ? "dark" : "light"));
   dom.fileMenuTrigger.addEventListener("click", () => toggleMenu(dom.fileMenuTrigger, dom.fileMenu));
+  dom.editMenuTrigger.addEventListener("click", () => toggleMenu(dom.editMenuTrigger, dom.editMenu));
   dom.recentTrigger.addEventListener("click", () => toggleMenu(dom.recentTrigger, dom.recentMenu));
 
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((target) => {
@@ -1254,6 +2094,13 @@ function registerActions(): void {
         case "save": void saveDocument(); break;
         case "save-as": void saveDocument(activeDocument(), true); break;
         case "open-search": openSearchPanel(); break;
+        case "open-replace": openReplacePanel(); break;
+        case "undo": runEditorCommand("undo"); break;
+        case "redo": runEditorCommand("redo"); break;
+        case "cut": void copySelectionToClipboard(true); break;
+        case "copy": void copySelectionToClipboard(false); break;
+        case "paste": void pasteFromClipboard(); break;
+        case "select-all": selectAllInEditor(); break;
         case "toggle-preview":
           setPreviewVisible(!previewVisible);
           if (previewVisible) void refreshPreview(false);
@@ -1265,9 +2112,32 @@ function registerActions(): void {
   document.addEventListener("pointerdown", (event) => {
     const target = event.target;
     if (target instanceof Node && !dom.fileMenu.contains(target) && !dom.fileMenuTrigger.contains(target) &&
-      !dom.recentMenu.contains(target) && !dom.recentTrigger.contains(target)) {
+      !dom.editMenu.contains(target) && !dom.editMenuTrigger.contains(target) &&
+      !dom.recentMenu.contains(target) && !dom.recentTrigger.contains(target) &&
+      !dom.editorContextMenu.contains(target)) {
       closeMenus();
     }
+  });
+
+  dom.editor.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    openEditorContextMenu(event.clientX, event.clientY);
+  });
+  dom.editorContextMenu.querySelectorAll<HTMLButtonElement>("[data-ctx]").forEach((item) => {
+    item.addEventListener("click", () => {
+      closeMenus();
+      switch (item.dataset.ctx) {
+        case "save": void saveDocument(); break;
+        case "rename": void renameActiveDocument(); break;
+        case "cut": void copySelectionToClipboard(true); break;
+        case "copy": void copySelectionToClipboard(false); break;
+        case "paste": void pasteFromClipboard(); break;
+        case "search": openSearchPanel(); break;
+        case "replace": openReplacePanel(); break;
+        case "occurrences": runEditorCommand("editor.action.changeAll"); break;
+        case "select-all": selectAllInEditor(); break;
+      }
+    });
   });
 
   dom.searchQuery.addEventListener("compositionstart", () => { isComposingSearch = true; });
@@ -1300,12 +2170,26 @@ function registerActions(): void {
   dom.searchLive.addEventListener("change", scheduleLiveSearch);
   element<HTMLButtonElement>("#search-submit").addEventListener("click", () => runSearch(true));
   element<HTMLButtonElement>("#search-close").addEventListener("click", closeSearchPanel);
-  dom.searchPrevious.addEventListener("click", () => selectMatch(activeMatchIndex - 1));
+  dom.searchPrevious.addEventListener("click", () =>
+    selectMatch(activeMatchIndex < 0 ? fileMatches.length - 1 : activeMatchIndex - 1),
+  );
   dom.searchNext.addEventListener("click", () => selectMatch(activeMatchIndex + 1));
   dom.replaceOne.addEventListener("click", replaceCurrent);
   dom.replaceAll.addEventListener("click", replaceEveryMatch);
   dom.scopeFile.addEventListener("click", () => setSearchScope("file"));
   dom.scopeFolder.addEventListener("click", () => setSearchScope("folder"));
+
+  dom.previewForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void navigateBrowser(dom.previewUrl.value);
+  });
+  dom.previewUrl.addEventListener("focus", () => dom.previewUrl.select());
+  dom.previewUrl.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      dom.previewUrl.value = addressForBrowserTarget();
+    }
+  });
 
   dom.languageSelect.addEventListener("change", () => {
     const current = activeDocument();
@@ -1324,6 +2208,10 @@ function registerActions(): void {
   element<HTMLButtonElement>("#window-close").addEventListener("click", () => void requestWindowClose());
 
   window.addEventListener("keydown", (event) => {
+    // Le dialogue modal de confirmation est prioritaire : ignorer tout
+    // raccourci pendant son affichage (un second showModal() lèverait une
+    // InvalidStateError, et des documents peuvent être fermés en arrière-plan).
+    if (dom.confirmDialog.open) return;
     const control = event.ctrlKey || event.metaKey;
     if (!control) {
       if (event.key === "Escape" && !dom.searchPanel.hidden) closeSearchPanel();
@@ -1333,7 +2221,7 @@ function registerActions(): void {
     const key = event.key.toLocaleLowerCase();
     const handled =
       key === "n" || key === "o" || key === "k" || key === "s" || key === "f" ||
-      key === "w" || (key === "v" && event.shiftKey);
+      key === "h" || key === "w" || (key === "v" && event.shiftKey);
     if (!handled) return;
     event.preventDefault();
     event.stopPropagation();
@@ -1349,6 +2237,8 @@ function registerActions(): void {
       void saveDocument();
     } else if (key === "f") {
       openSearchPanel();
+    } else if (key === "h") {
+      openReplacePanel();
     } else if (key === "v" && event.shiftKey) {
       setPreviewVisible(!previewVisible);
       if (previewVisible) void refreshPreview(false);
@@ -1366,7 +2256,7 @@ function registerActions(): void {
 
   if (appWindow) {
     void appWindow.onCloseRequested((event) => {
-      if (allowWindowClose || !documents.some((document) => document.dirty)) return;
+      if (windowClosePending || !documents.some((document) => document.dirty)) return;
       event.preventDefault();
       void requestWindowClose();
     });
@@ -1377,5 +2267,7 @@ injectStaticIcons();
 populateLanguages();
 applyTheme(activeTheme, false);
 setupResizers();
+setupSearchPanelDrag();
 registerActions();
 refreshChrome();
+void restoreSessionAfterReload();
