@@ -36,6 +36,8 @@
               <span class="menu-separator" role="separator"></span>
               <button role="menuitem" data-action="save"><span>Enregistrer</span><kbd>Ctrl S</kbd></button>
               <button role="menuitem" data-action="save-as"><span>Enregistrer sous</span><kbd>Ctrl Maj S</kbd></button>
+              <span class="menu-separator" role="separator"></span>
+              <button role="menuitemcheckbox" id="autosave-toggle" data-action="toggle-autosave" aria-checked="false"><span>Enregistrement automatique</span><kbd>1,5 s</kbd></button>
             </div>
           </div>
           <div class="menu-wrap">
@@ -54,6 +56,7 @@
               <span class="menu-separator" role="separator"></span>
               <button role="menuitem" data-action="open-search"><span>Rechercher…</span><kbd>Ctrl F</kbd></button>
               <button role="menuitem" data-action="open-replace"><span>Remplacer…</span><kbd>Ctrl H</kbd></button>
+              <button role="menuitem" data-action="compare"><span>Comparer des fichiers…</span><kbd>Ctrl D</kbd></button>
             </div>
           </div>
           <button class="menu-trigger" data-action="toggle-preview">Navigateur</button>
@@ -130,6 +133,15 @@
           <div id="editor-stage">
             <div id="welcome" class="welcome"></div>
             <div id="editor" aria-label="Contenu du fichier"></div>
+            <div id="diff-container" hidden>
+              <div class="diff-titlebar">
+                <strong id="diff-title">Comparaison</strong>
+                <button class="icon-button small" id="diff-close" type="button" aria-label="Fermer la comparaison" title="Fermer la comparaison (Échap)">
+                  <span data-icon="close"></span>
+                </button>
+              </div>
+              <div id="diff-editor" aria-label="Comparaison de fichiers"></div>
+            </div>
 
             <section id="search-panel" class="search-panel" aria-label="Recherche avancée" hidden>
               <div class="search-titlebar">
@@ -280,6 +292,50 @@
       <span class="menu-separator" role="separator"></span>
       <button role="menuitem" data-ctx="select-all"><span>Tout sélectionner</span><kbd>Ctrl A</kbd></button>
     </div>
+
+    <div id="explorer-context-menu" class="menu-popover editor-context-menu" role="menu" aria-label="Menu contextuel de l’explorateur" hidden>
+      <button role="menuitem" data-ecxt="new-file"><span>Nouveau fichier…</span></button>
+      <button role="menuitem" data-ecxt="new-folder"><span>Nouveau dossier…</span></button>
+      <span class="menu-separator" role="separator"></span>
+      <button role="menuitem" data-ecxt="rename"><span>Renommer…</span></button>
+      <button role="menuitem" data-ecxt="delete"><span>Supprimer</span></button>
+    </div>
+
+    <dialog id="prompt-dialog" class="confirm-dialog" aria-labelledby="prompt-title">
+      <form method="dialog" id="prompt-form">
+        <div class="dialog-copy">
+          <h2 id="prompt-title">Nom</h2>
+          <label class="prompt-field" for="prompt-input">
+            <span id="prompt-label">Nom</span>
+            <input id="prompt-input" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button id="prompt-cancel" class="button-secondary" value="cancel">Annuler</button>
+          <button id="prompt-accept" class="button-primary" value="confirm">Valider</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="compare-dialog" class="confirm-dialog" aria-labelledby="compare-title">
+      <form method="dialog" id="compare-form">
+        <div class="dialog-copy">
+          <h2 id="compare-title">Comparer des fichiers</h2>
+          <label class="prompt-field" for="compare-left">
+            <span>Original</span>
+            <select id="compare-left"></select>
+          </label>
+          <label class="prompt-field" for="compare-right">
+            <span>Modifié</span>
+            <select id="compare-right"></select>
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button class="button-secondary" value="cancel">Annuler</button>
+          <button id="compare-accept" class="button-primary" value="confirm">Comparer</button>
+        </div>
+      </form>
+    </dialog>
 
     <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   </body>

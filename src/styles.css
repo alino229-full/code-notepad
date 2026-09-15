@@ -1687,3 +1687,63 @@ input[type="checkbox"] {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* Comparaison de fichiers (Monaco DiffEditor) */
+#diff-container {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+}
+
+.diff-titlebar {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 9px 5px 13px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-raised);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+#diff-editor {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Champs des dialogues de saisie et de comparaison */
+.prompt-field {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+
+.prompt-field input,
+.prompt-field select {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.prompt-field select {
+  cursor: pointer;
+}
+
+.prompt-field input:focus-visible,
+.prompt-field select:focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

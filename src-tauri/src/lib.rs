@@ -137,6 +137,40 @@ fn rename_file(source: String, target: String) -> Result<u64, String> {
     Ok(modified_millis(&to))
 }
 
+#[tauri::command(async)]
+fn create_file(path: String, contents: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if target.exists() {
+        return Err("Un élément du même nom existe déjà.".to_string());
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.is_dir() {
+            return Err("Le dossier parent est introuvable.".to_string());
+        }
+    }
+    fs::write(&target, contents).map_err(|error| format!("Création impossible : {error}"))
+}
+
+#[tauri::command(async)]
+fn create_directory(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if target.exists() {
+        return Err("Un élément du même nom existe déjà.".to_string());
+    }
+    // create_dir (et non create_dir_all) : le parent doit exister, ce qui
+    // évite de créer silencieusement une arborescence mal saisie.
+    fs::create_dir(&target).map_err(|error| format!("Création impossible : {error}"))
+}
+
+#[tauri::command(async)]
+fn delete_to_trash(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err("L’élément à supprimer est introuvable.".to_string());
+    }
+    trash::delete(&target).map_err(|error| format!("Suppression impossible : {error}"))
+}
+
 fn atomic_write(target: &Path, file_name: &OsStr, contents: &str) -> Result<(), String> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let temporary = parent.join(format!(
@@ -637,6 +671,9 @@ pub fn run() {
             get_launch_files,
             write_file,
             rename_file,
+            create_file,
+            create_directory,
+            delete_to_trash,
             list_directory,
             index_project_sources,
             prepare_preview,
@@ -897,6 +934,60 @@ mod tests {
             fs::read_to_string(&moved).expect("moved file should exist"),
             "contenu"
         );
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn create_file_and_directory_refuse_existing_entries() {
+        let root = test_directory();
+        let file = root.join("note.txt");
+        fs::write(&file, "v1").expect("fixture should be written");
+        let path = file.to_string_lossy().into_owned();
+
+        assert!(create_file(path.clone(), "v2".to_string()).is_err());
+        assert!(create_directory(path.clone()).is_err());
+        assert_eq!(
+            fs::read_to_string(&file).expect("file should exist"),
+            "v1",
+            "les refus ne doivent pas écraser l'existant"
+        );
+
+        let created = root.join("nouveau.txt");
+        create_file(created.to_string_lossy().into_owned(), "vide".to_string())
+            .expect("new file should be created");
+        assert_eq!(
+            fs::read_to_string(&created).expect("created file should exist"),
+            "vide"
+        );
+
+        let directory = root.join("nouveau-dossier");
+        create_directory(directory.to_string_lossy().into_owned())
+            .expect("new directory should be created");
+        assert!(directory.is_dir());
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn create_file_requires_existing_parent() {
+        let root = test_directory();
+        let orphan = root.join("inconnu").join("note.txt");
+        assert!(create_file(orphan.to_string_lossy().into_owned(), String::new()).is_err());
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn delete_to_trash_removes_entry_and_reports_missing() {
+        let root = test_directory();
+        let file = root.join("poubelle.txt");
+        fs::write(&file, "à supprimer").expect("fixture should be written");
+
+        delete_to_trash(file.to_string_lossy().into_owned())
+            .expect("delete to trash should succeed");
+        assert!(
+            !file.exists(),
+            "l'élément ne doit plus être présent sur le disque"
+        );
+        assert!(delete_to_trash(file.to_string_lossy().into_owned()).is_err());
         fs::remove_dir_all(root).expect("test directory should be removed");
     }
 

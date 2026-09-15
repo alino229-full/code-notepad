@@ -6,6 +6,7 @@ import "@fontsource/jetbrains-mono/latin-400.css";
 import "@fontsource/jetbrains-mono/latin-600.css";
 
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -19,7 +20,38 @@ import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
 
 import { icon, type IconName } from "./icons";
-import { readRecents, readTheme, rememberRecent, removeRecent, saveTheme } from "./storage";
+import {
+  clearBuffer,
+  readAutosaveEnabled,
+  readBuffers,
+  readLastSession,
+  readRecents,
+  readTheme,
+  rememberLastSession,
+  rememberRecent,
+  removeRecent,
+  saveAutosaveEnabled,
+  saveBuffer,
+  saveTheme,
+  type SessionSnapshotData,
+} from "./storage";
+import {
+  defaultExtensionForLanguage,
+  FILE_TYPE_FILTERS,
+  fileNameHasExtension,
+} from "./lib/fileTypes";
+import {
+  extensionFromPath,
+  fileUrlToPath,
+  fileNameFromPath,
+  isPathWithin,
+  joinPath,
+  normalizeDialogPath,
+  parentDirectory,
+  pathEquals,
+  resolveBasePath,
+} from "./lib/paths";
+import { stripJsonComments } from "./lib/jsonc";
 import type {
   BrowserTarget,
   DirectoryListing,
@@ -53,69 +85,6 @@ const HTML_EXTENSIONS = new Set(["html", "htm"]);
 const TYPESCRIPT_IMPORT_DIAGNOSTICS_TO_IGNORE = [2307, 2792, 7016];
 const MODIFIED_EXTERNALLY_PREFIX = "MODIFIED_EXTERNALLY:";
 const SESSION_STORAGE_KEY = "code-notepad.session";
-
-// Types proposés dans les boîtes de dialogue ouvrir / enregistrer / renommer,
-// pour filtrer d'un geste plutôt que saisir une extension à la main.
-const FILE_TYPE_FILTERS: { name: string; extensions: string[] }[] = [
-  { name: "Tous les fichiers", extensions: ["*"] },
-  { name: "Texte", extensions: ["txt"] },
-  { name: "HTML", extensions: ["html", "htm"] },
-  { name: "CSS", extensions: ["css", "scss", "less"] },
-  { name: "JavaScript", extensions: ["js", "mjs", "cjs", "jsx"] },
-  { name: "TypeScript", extensions: ["ts", "tsx", "mts", "cts"] },
-  { name: "JSON", extensions: ["json"] },
-  { name: "Markdown", extensions: ["md", "markdown"] },
-  { name: "XML / SVG", extensions: ["xml", "svg"] },
-  { name: "YAML", extensions: ["yml", "yaml"] },
-  { name: "Python", extensions: ["py"] },
-  { name: "Rust", extensions: ["rs"] },
-  { name: "PHP", extensions: ["php"] },
-  { name: "Java", extensions: ["java"] },
-  { name: "C / C++", extensions: ["c", "h", "cc", "cpp", "hpp"] },
-  { name: "C#", extensions: ["cs"] },
-  { name: "SQL", extensions: ["sql"] },
-  { name: "Shell / PowerShell", extensions: ["sh", "ps1"] },
-];
-
-// Extension par défaut selon le langage du document : préremplit le nom lors
-// d'un premier enregistrement (« Nouveau-1 » + HTML → « Nouveau-1.html »).
-const LANGUAGE_DEFAULT_EXTENSIONS: Record<string, string> = {
-  html: ".html",
-  css: ".css",
-  scss: ".scss",
-  less: ".less",
-  javascript: ".js",
-  typescript: ".ts",
-  json: ".json",
-  markdown: ".md",
-  xml: ".xml",
-  yaml: ".yml",
-  python: ".py",
-  rust: ".rs",
-  php: ".php",
-  java: ".java",
-  csharp: ".cs",
-  cpp: ".cpp",
-  c: ".c",
-  sql: ".sql",
-  shell: ".sh",
-  vue: ".vue",
-  svelte: ".svelte",
-  plaintext: ".txt",
-};
-
-function defaultExtensionForLanguage(language: string): string {
-  return LANGUAGE_DEFAULT_EXTENSIONS[language] ?? ".txt";
-}
-
-function fileNameHasExtension(path: string): boolean {
-  const name = fileNameFromPath(path);
-  // Un point en tête (« .gitignore ») n'est pas une extension.
-  return name.lastIndexOf(".") > 0;
-}
-// Windows compare les chemins sans la casse ; les autres plateformes respectent
-// la casse du système de fichiers.
-const IS_WINDOWS = /^win/i.test(navigator.platform);
 
 function element<T extends Element>(selector: string): T {
   const result = document.querySelector<T>(selector);
@@ -176,6 +145,20 @@ const dom = {
   confirmCancel: element<HTMLButtonElement>("#confirm-cancel"),
   confirmAccept: element<HTMLButtonElement>("#confirm-accept"),
   editorContextMenu: element<HTMLElement>("#editor-context-menu"),
+  explorerContextMenu: element<HTMLElement>("#explorer-context-menu"),
+  promptDialog: element<HTMLDialogElement>("#prompt-dialog"),
+  promptTitle: element<HTMLElement>("#prompt-title"),
+  promptLabel: element<HTMLElement>("#prompt-label"),
+  promptInput: element<HTMLInputElement>("#prompt-input"),
+  promptCancel: element<HTMLButtonElement>("#prompt-cancel"),
+  promptAccept: element<HTMLButtonElement>("#prompt-accept"),
+  compareDialog: element<HTMLDialogElement>("#compare-dialog"),
+  compareLeft: element<HTMLSelectElement>("#compare-left"),
+  compareRight: element<HTMLSelectElement>("#compare-right"),
+  diffContainer: element<HTMLElement>("#diff-container"),
+  diffEditorHost: element<HTMLElement>("#diff-editor"),
+  diffTitle: element<HTMLElement>("#diff-title"),
+  autosaveToggle: element<HTMLButtonElement>("#autosave-toggle"),
   toastRegion: element<HTMLElement>("#toast-region"),
 };
 
@@ -285,7 +268,60 @@ if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
   });
 }
 
-let documents: OpenDocument[] = [];
+async function firstExistingPath(candidates: string[]): Promise<string | null> {
+  for (const candidate of candidates) {
+    try {
+      const listing = await invoke<DirectoryListing>("list_directory", {
+        path: parentDirectory(candidate),
+      });
+      if (listing.entries.some((entry) => pathEquals(entry.path, candidate))) return candidate;
+    } catch {
+      // Parent illisible : essayer le candidat suivant.
+    }
+  }
+  return null;
+}
+
+// Ctrl+clic sur une adresse détectée par Monaco : résoudre les chemins locaux
+// (dossier du fichier actif, racine de session) et les ouvrir dans l'éditeur ;
+// déléguer les liens http(s)/mailto au navigateur système. Sans cet ouvreur,
+// Monaco tenterait de naviguer la webview elle-même et rien ne se passait.
+monaco.editor.registerLinkOpener({
+  open: async (uri) => {
+    const raw = uri.toString(true);
+    if (/^(https?|mailto):/i.test(raw)) {
+      void openUrl(raw);
+      return true;
+    }
+    let candidate = raw;
+    try {
+      candidate = decodeURIComponent(raw.replace(/^file:\/\//i, ""));
+    } catch {
+      // Séquence d'échappement invalide : utiliser la forme brute.
+    }
+    candidate = candidate.split(/[?#]/)[0];
+    if (/^\/[a-zA-Z]:/.test(candidate)) candidate = candidate.slice(1);
+
+    const candidates: string[] = [];
+    if (/^[a-zA-Z]:[\\/]/.test(candidate) || candidate.startsWith("\\\\")) {
+      candidates.push(candidate);
+    } else {
+      const relative = candidate.replace(/^\/+/, "");
+      const activePath = activeDocument()?.path;
+      if (activePath) candidates.push(joinPath(parentDirectory(activePath), relative));
+      if (workspaceRoot) candidates.push(joinPath(workspaceRoot.path, relative));
+    }
+    const existing = await firstExistingPath(candidates);
+    if (!existing) {
+      showToast("Lien", `Fichier introuvable : ${candidate}`, "info");
+      return true;
+    }
+    await openFilePath(existing);
+    return true;
+  },
+});
+
+const documents: OpenDocument[] = [];
 let activeDocumentId: string | null = null;
 let workspaceRoot: TreeNode | null = null;
 let recents: RecentEntry[] = readRecents();
@@ -304,8 +340,16 @@ let remotePageLoaded = false;
 let windowClosePending = false;
 let untitledCounter = 1;
 let sessionReady = false;
+let autosaveEnabled = readAutosaveEnabled();
+let interfaceZoom = 1;
+let lastFolderMatches: DirectorySearchMatch[] = [];
+let diffEditor: monaco.editor.IStandaloneDiffEditor | null = null;
+let diffModels: { original: monaco.editor.ITextModel; modified: monaco.editor.ITextModel } | null = null;
+let explorerMenuTarget: TreeNode | null = null;
 let projectSourceLibraries: monaco.IDisposable[] = [];
 let projectContextGeneration = 0;
+const autosaveTimers = new Map<string, number>();
+const bufferTimers = new Map<string, number>();
 
 const sharedTypeScriptOptions: monaco.languages.typescript.CompilerOptions = {
   allowJs: true,
@@ -336,126 +380,12 @@ function activeDocument(): OpenDocument | undefined {
   return documents.find((document) => document.id === activeDocumentId);
 }
 
-function fileNameFromPath(path: string): string {
-  return path.split(/[\\/]/).pop() ?? path;
-}
-
-function extensionFromPath(path: string): string {
-  const name = fileNameFromPath(path);
-  const dot = name.lastIndexOf(".");
-  return dot >= 0 ? name.slice(dot + 1).toLocaleLowerCase() : "";
-}
-
 function guessLanguageFromPath(path: string): string {
   const extension = `.${extensionFromPath(path)}`;
   for (const language of monaco.languages.getLanguages()) {
     if (language.extensions?.includes(extension)) return language.id;
   }
   return "plaintext";
-}
-
-function normalizePath(path: string): string {
-  const unified = path.replace(/\\/g, "/");
-  return IS_WINDOWS ? unified.toLocaleLowerCase() : unified;
-}
-
-// Le dialogue Windows retourne des chemins verbatim « \\?\C:\… » : sans
-// normalisation, le même fichier peut s'ouvrir dans deux onglets.
-function normalizeDialogPath(path: string): string {
-  return path.replace(/^\\\\\?\\/, "");
-}
-
-function pathEquals(left: string, right: string): boolean {
-  return normalizePath(left) === normalizePath(right);
-}
-
-function isPathWithin(path: string, root: string): boolean {
-  const normalizedPath = normalizePath(path);
-  const normalizedRoot = normalizePath(root).replace(/\/$/, "");
-  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
-}
-
-function joinPath(root: string, child: string): string {
-  const separator = root.includes("\\") ? "\\" : "/";
-  return `${root.replace(/[\\/]$/, "")}${separator}${child}`;
-}
-
-function isAbsoluteBasePath(value: string): boolean {
-  return value.startsWith("/") || value.startsWith("\\\\") || /^[a-zA-Z]:[\\/]/.test(value);
-}
-
-function resolveBasePath(root: string, base: string): string {
-  return isAbsoluteBasePath(base) ? base : joinPath(root, base);
-}
-
-function stripTrailingCommas(source: string): string {
-  let result = "";
-  let inString = false;
-  let quote = "";
-  let escaped = false;
-  for (let index = 0; index < source.length; index += 1) {
-    const current = source[index];
-    if (inString) {
-      result += current;
-      if (escaped) escaped = false;
-      else if (current === "\\") escaped = true;
-      else if (current === quote) inString = false;
-      continue;
-    }
-    if (current === '"' || current === "'") {
-      inString = true;
-      quote = current;
-      result += current;
-      continue;
-    }
-    if (current === ",") {
-      let lookahead = index + 1;
-      while (lookahead < source.length && /\s/.test(source[lookahead])) lookahead += 1;
-      const next = source[lookahead];
-      if (next === "}" || next === "]") continue;
-    }
-    result += current;
-  }
-  return result;
-}
-
-function stripJsonComments(source: string): string {
-  let result = "";
-  let inString = false;
-  let quote = "";
-  let escaped = false;
-  for (let index = 0; index < source.length; index += 1) {
-    const current = source[index];
-    const next = source[index + 1];
-    if (inString) {
-      result += current;
-      if (escaped) escaped = false;
-      else if (current === "\\") escaped = true;
-      else if (current === quote) inString = false;
-      continue;
-    }
-    if (current === '"' || current === "'") {
-      inString = true;
-      quote = current;
-      result += current;
-      continue;
-    }
-    if (current === "/" && next === "/") {
-      while (index < source.length && source[index] !== "\n") index += 1;
-      result += "\n";
-      continue;
-    }
-    if (current === "/" && next === "*") {
-      index += 2;
-      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) index += 1;
-      index += 1;
-      continue;
-    }
-    result += current;
-  }
-  // Le retrait des virgules traînantes connaît l'état des chaînes pour ne pas
-  // corrompre une valeur contenant «,} » ou «,] ».
-  return stripTrailingCommas(result);
 }
 
 async function readProjectCompilerOptions(root: string): Promise<monaco.languages.typescript.CompilerOptions> {
@@ -647,7 +577,79 @@ function watchDocument(documentRecord: OpenDocument): monaco.IDisposable {
       renderStatus();
       void updateWindowTitle();
     }
+    scheduleBufferSave(documentRecord);
+    scheduleAutosave(documentRecord);
   });
+}
+
+const AUTOSAVE_DELAY_MS = 1500;
+const BUFFER_DELAY_MS = 800;
+const MAX_BUFFER_CHARS = 400_000;
+
+function documentBufferKey(documentRecord: OpenDocument): string {
+  return documentRecord.path ?? `untitled:${documentRecord.id}`;
+}
+
+// Tampon anti-crash : le contenu non enregistré est conservé dans le
+// localStorage et repris au prochain démarrage.
+function scheduleBufferSave(documentRecord: OpenDocument): void {
+  window.clearTimeout(bufferTimers.get(documentRecord.id));
+  bufferTimers.set(
+    documentRecord.id,
+    window.setTimeout(() => {
+      bufferTimers.delete(documentRecord.id);
+      if (!documents.includes(documentRecord) || !documentRecord.dirty) return;
+      const contents = documentRecord.model.getValue();
+      if (contents.length > MAX_BUFFER_CHARS) return;
+      saveBuffer(documentBufferKey(documentRecord), {
+        path: documentRecord.path,
+        name: documentRecord.name,
+        language: documentRecord.language,
+        contents,
+        modifiedAt: Date.now(),
+      });
+    }, BUFFER_DELAY_MS),
+  );
+}
+
+function scheduleAutosave(documentRecord: OpenDocument): void {
+  if (!autosaveEnabled || !documentRecord.path) return;
+  window.clearTimeout(autosaveTimers.get(documentRecord.id));
+  autosaveTimers.set(
+    documentRecord.id,
+    window.setTimeout(() => {
+      autosaveTimers.delete(documentRecord.id);
+      if (!documents.includes(documentRecord) || !documentRecord.dirty || !documentRecord.path) return;
+      void persistDocument(documentRecord, documentRecord.path, documentRecord.modified, true);
+    }, AUTOSAVE_DELAY_MS),
+  );
+}
+
+function clearDocumentTracking(documentRecord: OpenDocument): void {
+  window.clearTimeout(autosaveTimers.get(documentRecord.id));
+  autosaveTimers.delete(documentRecord.id);
+  window.clearTimeout(bufferTimers.get(documentRecord.id));
+  bufferTimers.delete(documentRecord.id);
+  clearBuffer(documentBufferKey(documentRecord));
+}
+
+function setAutosaveEnabled(enabled: boolean): void {
+  autosaveEnabled = enabled;
+  saveAutosaveEnabled(enabled);
+  dom.autosaveToggle.setAttribute("aria-checked", String(enabled));
+  showToast(
+    "Enregistrement automatique",
+    enabled ? "Activé : les fichiers enregistrés sont sauvegardés 1,5 s après la dernière frappe." : "Désactivé.",
+    "info",
+  );
+  if (enabled) {
+    for (const documentRecord of documents) {
+      if (documentRecord.dirty) scheduleAutosave(documentRecord);
+    }
+    return;
+  }
+  for (const timer of autosaveTimers.values()) window.clearTimeout(timer);
+  autosaveTimers.clear();
 }
 
 const noopDisposable: monaco.IDisposable = { dispose() {} };
@@ -740,7 +742,7 @@ function renderTabs(): void {
     selectButton.addEventListener("click", () => switchDocument(documentRecord.id));
     selectButton.addEventListener("keydown", (event) => {
       const currentIndex = documents.findIndex((candidate) => candidate.id === documentRecord.id);
-      let nextIndex = currentIndex;
+      let nextIndex: number;
       if (event.key === "ArrowLeft") nextIndex = (currentIndex - 1 + documents.length) % documents.length;
       else if (event.key === "ArrowRight") nextIndex = (currentIndex + 1) % documents.length;
       else if (event.key === "Home") nextIndex = 0;
@@ -861,57 +863,111 @@ function refreshChrome(): void {
   if (sessionReady) saveSessionSnapshot();
 }
 
-interface SessionSnapshot {
-  workspace: string | null;
-  paths: string[];
-  activePath: string | null;
+function buildSessionSnapshot(): SessionSnapshotData {
+  return {
+    workspace: workspaceRoot?.path ?? null,
+    paths: documents.filter((document) => document.path).map((document) => document.path as string),
+    activePath: activeDocument()?.path ?? null,
+  };
 }
 
 function saveSessionSnapshot(): void {
+  const snapshot = buildSessionSnapshot();
   try {
-    const snapshot: SessionSnapshot = {
-      workspace: workspaceRoot?.path ?? null,
-      paths: documents.filter((document) => document.path).map((document) => document.path as string),
-      activePath: activeDocument()?.path ?? null,
-    };
     sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(snapshot));
   } catch {
-    // Stockage indisponible : la session ne sera simplement pas restaurée.
+    // Stockage de session indisponible : la restauration après rechargement
+    // ne sera simplement pas possible.
+  }
+  rememberLastSession(snapshot);
+}
+
+async function restoreFromSnapshot(snapshot: SessionSnapshotData, silent: boolean): Promise<void> {
+  let restored = 0;
+  if (snapshot.workspace) {
+    await openFolderPath(normalizeDialogPath(snapshot.workspace), true);
+  }
+  for (const path of snapshot.paths) {
+    const before = documents.length;
+    await openFilePath(normalizeDialogPath(path), undefined, undefined, true);
+    if (documents.length > before) restored += 1;
+  }
+  const activePath = snapshot.activePath ? normalizeDialogPath(snapshot.activePath) : null;
+  const activeDoc = activePath
+    ? documents.find((document) => document.path && pathEquals(document.path, activePath))
+    : undefined;
+  if (activeDoc) switchDocument(activeDoc.id);
+  if (!silent && (restored > 0 || workspaceRoot)) {
+    showToast(
+      "Session restaurée",
+      `${restored} fichier${restored > 1 ? "s" : ""} et le dossier ont été rouverts.`,
+      "info",
+    );
+  }
+}
+
+async function recoverUnsavedBuffers(): Promise<void> {
+  const buffers = readBuffers();
+  let recovered = 0;
+  for (const [key, entry] of Object.entries(buffers)) {
+    clearBuffer(key);
+    if (!entry.contents) continue;
+    if (entry.path) {
+      let documentRecord = documents.find(
+        (candidate) => candidate.path && pathEquals(candidate.path, entry.path as string),
+      );
+      if (!documentRecord) {
+        await openFilePath(entry.path, undefined, undefined, true);
+        documentRecord = documents.find(
+          (candidate) => candidate.path && pathEquals(candidate.path, entry.path as string),
+        );
+      }
+      if (documentRecord && documentRecord.model.getValue() !== entry.contents) {
+        documentRecord.suppressDirty = true;
+        documentRecord.model.setValue(entry.contents);
+        documentRecord.suppressDirty = false;
+        documentRecord.dirty = true;
+        recovered += 1;
+      }
+    } else {
+      documents.push(createDocument(entry.name, null, entry.contents, entry.language));
+      recovered += 1;
+    }
+  }
+  if (recovered > 0) {
+    refreshChrome();
+    showToast(
+      "Récupération",
+      `${recovered} tampon${recovered > 1 ? "s" : ""} de modifications non enregistrées restauré${recovered > 1 ? "s" : ""}.`,
+      "info",
+    );
   }
 }
 
 async function restoreSessionAfterReload(): Promise<void> {
-  let snapshot: SessionSnapshot | null = null;
+  let snapshot: SessionSnapshotData | null = null;
   try {
     const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
     sessionStorage.removeItem(SESSION_STORAGE_KEY);
-    if (raw) snapshot = JSON.parse(raw) as SessionSnapshot;
+    if (raw) snapshot = JSON.parse(raw) as SessionSnapshotData;
   } catch {
     snapshot = null;
   }
   if (snapshot?.paths?.length || snapshot?.workspace) {
-    let restored = 0;
-    if (snapshot.workspace) {
-      await openFolderPath(normalizeDialogPath(snapshot.workspace), true);
-    }
-    for (const path of snapshot.paths) {
-      const before = documents.length;
-      await openFilePath(normalizeDialogPath(path), undefined, undefined, true);
-      if (documents.length > before) restored += 1;
-    }
-    const activePath = snapshot.activePath ? normalizeDialogPath(snapshot.activePath) : null;
-    const activeDoc = activePath
-      ? documents.find((document) => document.path && pathEquals(document.path, activePath))
-      : undefined;
-    if (activeDoc) switchDocument(activeDoc.id);
-    if (restored > 0 || workspaceRoot) {
-      showToast(
-        "Session restaurée",
-        `${restored} fichier${restored > 1 ? "s" : ""} et le dossier ont été rouverts après le rechargement de la page.`,
-        "info",
+    // Rechargement de la page (Vite, crash webview) : restauration silencieuse.
+    await restoreFromSnapshot(snapshot, true);
+  } else {
+    const last = readLastSession();
+    if (last && (last.paths.length > 0 || last.workspace)) {
+      const confirmed = await confirmAction(
+        "Réouvrir la dernière session ?",
+        `${last.paths.length} fichier${last.paths.length > 1 ? "s" : ""}${last.workspace ? ` et le dossier « ${fileNameFromPath(last.workspace)} »` : ""} seront rouverts.`,
+        "Réouvrir la session",
       );
+      if (confirmed) await restoreFromSnapshot(last, false);
     }
   }
+  await recoverUnsavedBuffers();
   sessionReady = true;
   saveSessionSnapshot();
 }
@@ -1018,8 +1074,10 @@ async function persistDocument(
   documentRecord: OpenDocument,
   target: string,
   expectedModified: number,
+  silent = false,
 ): Promise<boolean> {
   const isNewTarget = !documentRecord.path || !pathEquals(documentRecord.path, target);
+  const previousBufferKey = documentBufferKey(documentRecord);
   try {
     const modified = await invoke<number>("write_file", {
       path: target,
@@ -1033,9 +1091,11 @@ async function persistDocument(
     monaco.editor.setModelLanguage(documentRecord.model, documentRecord.language);
     documentRecord.modified = modified;
     documentRecord.dirty = false;
+    clearBuffer(previousBufferKey);
+    clearBuffer(documentBufferKey(documentRecord));
     recents = rememberRecent("file", target, documentRecord.name);
     refreshChrome();
-    showToast("Enregistré", documentRecord.name, "success");
+    if (!silent) showToast("Enregistré", documentRecord.name, "success");
     scheduleProjectContextRefresh(target);
     return true;
   } catch (error) {
@@ -1046,7 +1106,7 @@ async function persistDocument(
         `« ${documentRecord.name} » a été modifié par une autre application depuis son ouverture. Enregistrer remplacera cette version externe.`,
         "Écraser le fichier",
       );
-      if (overwrite) return persistDocument(documentRecord, target, 0);
+      if (overwrite) return persistDocument(documentRecord, target, 0, silent);
       renderStatus();
       return false;
     }
@@ -1094,6 +1154,10 @@ async function saveDocument(documentRecord = activeDocument(), saveAs = false): 
 }
 
 function disposeDocument(documentRecord: OpenDocument): void {
+  clearDocumentTracking(documentRecord);
+  if (diffModels && (diffModels.original === documentRecord.model || diffModels.modified === documentRecord.model)) {
+    closeComparison();
+  }
   documentRecord.disposeChangeListener.dispose();
   documentRecord.model.dispose();
 }
@@ -1193,6 +1257,7 @@ function renderTree(nodes: TreeNode[]): HTMLUListElement {
   for (const node of nodes) {
     const item = document.createElement("li");
     const row = document.createElement("div");
+    row.dataset.path = node.path;
     row.className = `tree-row${activeDocument()?.path && pathEquals(activeDocument()!.path!, node.path) ? " is-active" : ""}`;
 
     const toggle = document.createElement("button");
@@ -1354,6 +1419,7 @@ function closeMenus(): void {
   dom.editMenu.hidden = true;
   dom.recentMenu.hidden = true;
   dom.editorContextMenu.hidden = true;
+  dom.explorerContextMenu.hidden = true;
   dom.fileMenuTrigger.setAttribute("aria-expanded", "false");
   dom.editMenuTrigger.setAttribute("aria-expanded", "false");
   dom.recentTrigger.setAttribute("aria-expanded", "false");
@@ -1400,18 +1466,6 @@ function addressForBrowserTarget(): string {
   return browserTarget.kind === "remote" ? browserTarget.url : browserTarget.path;
 }
 
-function fileUrlToPath(value: string): string | null {
-  try {
-    const parsed = new URL(value);
-    if (parsed.protocol !== "file:") return null;
-    let pathname = decodeURIComponent(parsed.pathname);
-    if (/^\/[a-zA-Z]:/.test(pathname)) pathname = pathname.slice(1);
-    return pathname.replace(/\//g, "\\");
-  } catch {
-    return null;
-  }
-}
-
 const LOCAL_ADDRESS_PATTERN = new RegExp(
   [
     "localhost(?::\\d{1,5})?(?:/[^\\s]*)?",
@@ -1430,12 +1484,6 @@ function relativeBaseDirectory(): string | null {
   if (workspaceRoot) return workspaceRoot.path;
   const currentPath = activeDocument()?.path;
   return currentPath ? parentDirectory(currentPath) : null;
-}
-
-function parentDirectory(path: string): string {
-  const normalized = path.replace(/[\\/]+$/, "");
-  const cut = Math.max(normalized.lastIndexOf("\\"), normalized.lastIndexOf("/"));
-  return cut > 0 ? normalized.slice(0, cut) : normalized;
 }
 
 async function showRemotePage(url: string): Promise<void> {
@@ -1617,6 +1665,271 @@ function openReplacePanel(): void {
   dom.replaceValue.focus();
 }
 
+function openCompareDialog(): void {
+  if (dom.compareDialog.open || dom.confirmDialog.open || dom.promptDialog.open) return;
+  if (documents.length < 2) {
+    showToast("Comparer", "Ouvrez au moins deux fichiers pour les comparer.", "info");
+    return;
+  }
+  const labelFor = (documentRecord: OpenDocument): string =>
+    `${documentRecord.name}${documentRecord.path ? ` — ${documentRecord.path}` : " (non enregistré)"}`;
+  for (const select of [dom.compareLeft, dom.compareRight]) {
+    select.replaceChildren();
+    for (const documentRecord of documents) {
+      const option = document.createElement("option");
+      option.value = documentRecord.id;
+      option.textContent = labelFor(documentRecord);
+      select.append(option);
+    }
+  }
+  const activeIndex = Math.max(
+    0,
+    documents.findIndex((documentRecord) => documentRecord.id === activeDocumentId),
+  );
+  dom.compareLeft.selectedIndex = activeIndex;
+  dom.compareRight.selectedIndex = documents.length > 1 ? (activeIndex + 1) % documents.length : 0;
+  dom.compareDialog.showModal();
+}
+
+// La comparaison utilise les modèles vivants : les retouches faites dans
+// l'éditeur se reflètent en direct, en lecture seule.
+function openComparison(): void {
+  const left = documents.find((documentRecord) => documentRecord.id === dom.compareLeft.value);
+  const right = documents.find((documentRecord) => documentRecord.id === dom.compareRight.value);
+  if (!left || !right) return;
+  if (left.id === right.id) {
+    showToast("Comparer", "Sélectionnez deux fichiers différents.", "info");
+    return;
+  }
+  diffEditor?.dispose();
+  dom.diffContainer.hidden = false;
+  dom.welcome.hidden = true;
+  diffEditor = monaco.editor.createDiffEditor(dom.diffEditorHost, {
+    readOnly: true,
+    originalEditable: false,
+    automaticLayout: true,
+    renderSideBySide: true,
+    fontSize: 13,
+    lineHeight: 22,
+    fontFamily: "JetBrains Mono, Cascadia Code, Consolas, monospace",
+    scrollBeyondLastLine: false,
+  });
+  diffModels = { original: left.model, modified: right.model };
+  diffEditor.setModel({ original: left.model, modified: right.model });
+  dom.diffTitle.textContent = `${left.name} ↔ ${right.name}`;
+}
+
+function closeComparison(): void {
+  diffEditor?.dispose();
+  diffEditor = null;
+  diffModels = null;
+  dom.diffContainer.hidden = true;
+  refreshChrome();
+}
+
+function isValidEntryName(name: string): boolean {
+  return name.length > 0 && !/[\\/:*?"<>|]/.test(name) && !/[. ]$/.test(name);
+}
+
+function promptText(title: string, label: string, value: string): Promise<string | null> {
+  if (dom.promptDialog.open || dom.confirmDialog.open || dom.compareDialog.open) {
+    return Promise.resolve(null);
+  }
+  dom.promptTitle.textContent = title;
+  dom.promptLabel.textContent = label;
+  dom.promptInput.value = value;
+  dom.promptDialog.showModal();
+  window.setTimeout(() => {
+    dom.promptInput.focus();
+    const dot = value.lastIndexOf(".");
+    dom.promptInput.setSelectionRange(0, dot > 0 ? dot : value.length);
+  }, 0);
+  return new Promise((resolve) => {
+    dom.promptDialog.addEventListener(
+      "close",
+      () => resolve(dom.promptDialog.returnValue === "confirm" ? dom.promptInput.value.trim() : null),
+      { once: true },
+    );
+  });
+}
+
+function findTreeNode(node: TreeNode, path: string): TreeNode | null {
+  if (pathEquals(node.path, path)) return node;
+  for (const child of node.children ?? []) {
+    const found = findTreeNode(child, path);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findParentNode(node: TreeNode, path: string): TreeNode | null {
+  for (const child of node.children ?? []) {
+    if (pathEquals(child.path, path)) return node;
+    const found = findParentNode(child, path);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function refreshNodeChildren(node: TreeNode): Promise<void> {
+  if (!node.isDirectory) return;
+  try {
+    const listing = await invoke<DirectoryListing>("list_directory", { path: node.path });
+    node.children = listing.entries.map(toTreeNode);
+    node.truncated = listing.truncated;
+  } catch (error) {
+    showToast("Dossier illisible", `${node.name} : ${errorMessage(error)}`, "error");
+  }
+  renderExplorer();
+}
+
+async function createExplorerEntry(directoryNode: TreeNode, kind: "file" | "folder"): Promise<void> {
+  const title = kind === "file" ? "Nouveau fichier" : "Nouveau dossier";
+  const name = await promptText(title, "Nom", kind === "file" ? "nouveau.txt" : "nouveau-dossier");
+  if (!name) return;
+  if (!isValidEntryName(name)) {
+    showToast(title, "Ce nom est invalide ou contient des caractères interdits : \\ / : * ? \" < > |", "error");
+    return;
+  }
+  const target = joinPath(directoryNode.path, name);
+  try {
+    if (kind === "file") await invoke("create_file", { path: target, contents: "" });
+    else await invoke("create_directory", { path: target });
+    await refreshNodeChildren(directoryNode);
+    if (kind === "file") await openFilePath(target);
+    showToast(title, name, "success");
+    scheduleProjectContextRefresh(target);
+  } catch (error) {
+    showToast(title, errorMessage(error), "error");
+  }
+}
+
+// Répercute un renommage/déplacement de l'explorateur sur les documents ouverts
+// du sous-arbre (modèles relocalisés, tampons nettoyés).
+async function remapDocumentsUnder(previousPath: string, targetPath: string): Promise<void> {
+  for (const documentRecord of [...documents]) {
+    if (!documentRecord.path || !isPathWithin(documentRecord.path, previousPath)) continue;
+    const nextPath = `${targetPath}${documentRecord.path.slice(previousPath.length)}`;
+    if (
+      documents.some(
+        (candidate) => candidate !== documentRecord && candidate.path && pathEquals(candidate.path, nextPath),
+      )
+    ) {
+      continue;
+    }
+    const isDirect = pathEquals(documentRecord.path, previousPath);
+    const previousKey = documentBufferKey(documentRecord);
+    renameDocumentModel(documentRecord, nextPath);
+    documentRecord.path = nextPath;
+    documentRecord.name = fileNameFromPath(nextPath);
+    documentRecord.language = guessLanguageFromPath(nextPath);
+    monaco.editor.setModelLanguage(documentRecord.model, documentRecord.language);
+    clearBuffer(previousKey);
+    if (isDirect) {
+      try {
+        const content = await invoke<FileContent>("read_file", { path: nextPath });
+        documentRecord.modified = content.modified;
+        recents = removeRecent(previousPath);
+        recents = rememberRecent("file", nextPath, documentRecord.name);
+      } catch {
+        documentRecord.modified = 0;
+      }
+    }
+  }
+  refreshChrome();
+}
+
+async function renameExplorerNode(node: TreeNode): Promise<void> {
+  const name = await promptText("Renommer", "Nouveau nom", node.name);
+  if (!name || name === node.name) return;
+  if (!isValidEntryName(name)) {
+    showToast("Renommer", "Ce nom est invalide ou contient des caractères interdits : \\ / : * ? \" < > |", "error");
+    return;
+  }
+  const previousPath = node.path;
+  const target = joinPath(parentDirectory(previousPath), name);
+  if (documents.some((candidate) => candidate.path && pathEquals(candidate.path, target))) {
+    showToast("Renommage impossible", "Un fichier du même nom est déjà ouvert dans un onglet.", "error");
+    return;
+  }
+  try {
+    await invoke("rename_file", { source: previousPath, target });
+    await remapDocumentsUnder(previousPath, target);
+    const parent = workspaceRoot ? findParentNode(workspaceRoot, previousPath) : null;
+    const listingRoot = parent ?? workspaceRoot;
+    if (listingRoot) await refreshNodeChildren(listingRoot);
+    showToast("Renommé", `${fileNameFromPath(previousPath)} → ${name}`, "success");
+    scheduleProjectContextRefresh(target);
+  } catch (error) {
+    showToast("Renommage impossible", errorMessage(error), "error");
+  }
+}
+
+async function deleteExplorerNode(node: TreeNode): Promise<void> {
+  const confirmed = await confirmAction(
+    "Supprimer",
+    `Supprimer « ${node.name} » ? ${node.isDirectory ? "Le dossier et tout son contenu seront déplacés vers la corbeille." : "Le fichier sera déplacé vers la corbeille."}`,
+    "Supprimer",
+  );
+  if (!confirmed) return;
+  const affected = documents.filter(
+    (documentRecord) =>
+      documentRecord.path &&
+      (pathEquals(documentRecord.path, node.path) || isPathWithin(documentRecord.path, node.path)),
+  );
+  for (const documentRecord of affected) {
+    await closeDocument(documentRecord.id, true);
+  }
+  try {
+    await invoke("delete_to_trash", { path: node.path });
+    for (const documentRecord of affected) {
+      if (documentRecord.path) recents = removeRecent(documentRecord.path);
+    }
+    const parent = workspaceRoot ? findParentNode(workspaceRoot, node.path) : null;
+    if (parent) await refreshNodeChildren(parent);
+    else renderExplorer();
+    showToast("Supprimé", node.name, "success");
+    if (workspaceRoot) scheduleProjectContextRefresh(workspaceRoot.path);
+  } catch (error) {
+    showToast("Suppression impossible", errorMessage(error), "error");
+  }
+}
+
+function openExplorerContextMenu(x: number, y: number, target: TreeNode | null): void {
+  closeMenus();
+  explorerMenuTarget = target;
+  const atRoot = target !== null && workspaceRoot !== null && pathEquals(target.path, workspaceRoot.path);
+  const directoryTarget = target
+    ? target.isDirectory
+      ? target
+      : ((workspaceRoot ? findParentNode(workspaceRoot, target.path) : null) ?? (atRoot ? workspaceRoot : null))
+    : workspaceRoot;
+  const setDisabled = (kind: string, disabled: boolean): void => {
+    const button = dom.explorerContextMenu.querySelector<HTMLButtonElement>(`[data-ecxt="${kind}"]`);
+    if (button) button.disabled = disabled;
+  };
+  setDisabled("new-file", !directoryTarget);
+  setDisabled("new-folder", !directoryTarget);
+  setDisabled("rename", !target || atRoot);
+  setDisabled("delete", !target || atRoot);
+  dom.explorerContextMenu.hidden = false;
+  const width = dom.explorerContextMenu.offsetWidth;
+  const height = dom.explorerContextMenu.offsetHeight;
+  dom.explorerContextMenu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - width - 8))}px`;
+  dom.explorerContextMenu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - height - 8))}px`;
+  dom.explorerContextMenu.querySelector<HTMLButtonElement>("button:not([disabled])")?.focus();
+}
+
+async function handleDroppedPaths(paths: string[]): Promise<void> {
+  for (const raw of paths) {
+    const path = normalizeDialogPath(raw);
+    await openFilePath(path, undefined, undefined, true);
+    if (!documents.some((candidate) => candidate.path && pathEquals(candidate.path, path))) {
+      await openFolderPath(path, true);
+    }
+  }
+}
+
 function openEditorContextMenu(x: number, y: number): void {
   closeMenus();
   dom.editorContextMenu.hidden = false;
@@ -1655,6 +1968,7 @@ async function renameActiveDocument(): Promise<void> {
   try {
     dom.statusState.textContent = "Renommage…";
     const modified = await invoke<number>("rename_file", { source: previousPath, target });
+    clearBuffer(previousPath);
     renameDocumentModel(current, target);
     current.path = target;
     current.name = fileNameFromPath(target);
@@ -1692,7 +2006,9 @@ function updateSearchControls(): void {
   dom.searchPrevious.disabled = !fileScope || fileMatches.length === 0;
   dom.searchNext.disabled = !fileScope || fileMatches.length === 0;
   dom.replaceOne.disabled = !fileScope || fileMatches.length === 0;
-  dom.replaceAll.disabled = !fileScope || fileMatches.length === 0;
+  dom.replaceAll.disabled = fileScope
+    ? fileMatches.length === 0
+    : lastFolderMatches.length === 0;
   dom.scopeFolder.disabled = !workspaceRoot;
   dom.scopeFile.setAttribute("aria-pressed", String(fileScope));
   dom.scopeFolder.setAttribute("aria-pressed", String(!fileScope));
@@ -1789,10 +2105,12 @@ async function runFolderSearch(): Promise<void> {
       options: searchOptions(),
     });
     if (generation !== folderSearchGeneration) return;
+    lastFolderMatches = matches;
     renderFolderResults(matches);
     setSearchCount(`${matches.length} résultat${matches.length > 1 ? "s" : ""}`);
   } catch (error) {
     if (generation !== folderSearchGeneration) return;
+    lastFolderMatches = [];
     setSearchCount(errorMessage(error), true);
     renderFolderResults([]);
   }
@@ -1851,7 +2169,11 @@ function replaceCurrent(): void {
   runFileSearch(true);
 }
 
-function replaceEveryMatch(): void {
+async function replaceEveryMatch(): Promise<void> {
+  if (searchScope === "folder") {
+    await replaceAllInFolder();
+    return;
+  }
   if (fileMatches.length === 0) return;
   const replacement = dom.replaceValue.value;
   codeEditor.executeEdits(
@@ -1863,6 +2185,91 @@ function replaceEveryMatch(): void {
     })),
   );
   runFileSearch(false);
+}
+
+function buildFolderReplaceRegExp(): RegExp | null {
+  try {
+    let source = dom.searchRegex.checked
+      ? dom.searchQuery.value
+      : dom.searchQuery.value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (dom.searchWord.checked) source = `\\b(?:${source})\\b`;
+    return new RegExp(source, dom.searchCase.checked ? "g" : "gi");
+  } catch {
+    return null;
+  }
+}
+
+// Remplacement multi-fichiers : réécrit chaque fichier du dernier résultat de
+// recherche (les tampons non enregistrés sont ignorés pour ne rien perdre).
+async function replaceAllInFolder(): Promise<void> {
+  const expression = buildFolderReplaceRegExp();
+  if (!expression) {
+    setSearchCount("Expression régulière invalide", true);
+    return;
+  }
+  if (lastFolderMatches.length === 0) return;
+  const replacement = dom.replaceValue.value;
+  const files = [...new Map(lastFolderMatches.map((match) => [match.path, match])).values()];
+  const confirmed = await confirmAction(
+    "Tout remplacer dans le dossier",
+    `Remplacer dans ${files.length} fichier${files.length > 1 ? "s" : ""} ? Les fichiers modifiés seront enregistrés directement sur le disque.`,
+    "Tout remplacer",
+  );
+  if (!confirmed) return;
+
+  let touchedFiles = 0;
+  let totalReplacements = 0;
+  let skipped = 0;
+  const errors: string[] = [];
+  for (const file of files) {
+    const openDirty = documents.find(
+      (candidate) => candidate.path && pathEquals(candidate.path, file.path) && candidate.dirty,
+    );
+    if (openDirty) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      const content = await invoke<FileContent>("read_file", { path: file.path });
+      const occurrences = content.contents.match(expression);
+      if (!occurrences || occurrences.length === 0) continue;
+      expression.lastIndex = 0;
+      const next = content.contents.replace(expression, replacement);
+      const modified = await invoke<number>("write_file", {
+        path: file.path,
+        contents: next,
+        expectedModified: content.modified,
+      });
+      touchedFiles += 1;
+      totalReplacements += occurrences.length;
+      const documentRecord = documents.find(
+        (candidate) => candidate.path && pathEquals(candidate.path, file.path),
+      );
+      if (documentRecord) {
+        documentRecord.suppressDirty = true;
+        documentRecord.model.setValue(next);
+        documentRecord.suppressDirty = false;
+        documentRecord.modified = modified;
+        documentRecord.dirty = false;
+        clearBuffer(documentBufferKey(documentRecord));
+      }
+    } catch (error) {
+      errors.push(`${file.path} : ${errorMessage(error)}`);
+    }
+  }
+  refreshChrome();
+  const summary = `${totalReplacements} remplacement${totalReplacements > 1 ? "s" : ""} dans ${touchedFiles} fichier${touchedFiles > 1 ? "s" : ""}`;
+  setSearchCount(
+    errors.length > 0
+      ? `${summary} — ${errors.length} échec${errors.length > 1 ? "s" : ""}`
+      : summary,
+  );
+  if (skipped > 0) {
+    showToast("Tout remplacer", `${summary} — ${skipped} fichier${skipped > 1 ? "s" : ""} ignoré${skipped > 1 ? "s" : ""} (modifications non enregistrées).`, "info");
+  } else {
+    showToast("Tout remplacer", errors.length > 0 ? `${summary}. ${errors[0]}` : `${summary}.`, errors.length > 0 ? "error" : "success");
+  }
+  void runFolderSearch();
 }
 
 function setSearchScope(scope: SearchScope): void {
@@ -2112,6 +2519,8 @@ function registerActions(): void {
         case "save-as": void saveDocument(activeDocument(), true); break;
         case "open-search": openSearchPanel(); break;
         case "open-replace": openReplacePanel(); break;
+        case "compare": openCompareDialog(); break;
+        case "toggle-autosave": setAutosaveEnabled(!autosaveEnabled); break;
         case "undo": runEditorCommand("undo"); break;
         case "redo": runEditorCommand("redo"); break;
         case "cut": void copySelectionToClipboard(true); break;
@@ -2131,7 +2540,7 @@ function registerActions(): void {
     if (target instanceof Node && !dom.fileMenu.contains(target) && !dom.fileMenuTrigger.contains(target) &&
       !dom.editMenu.contains(target) && !dom.editMenuTrigger.contains(target) &&
       !dom.recentMenu.contains(target) && !dom.recentTrigger.contains(target) &&
-      !dom.editorContextMenu.contains(target)) {
+      !dom.editorContextMenu.contains(target) && !dom.explorerContextMenu.contains(target)) {
       closeMenus();
     }
   });
@@ -2139,6 +2548,30 @@ function registerActions(): void {
   dom.editor.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     openEditorContextMenu(event.clientX, event.clientY);
+  });
+
+  dom.explorerContent.addEventListener("contextmenu", (event) => {
+    if (!workspaceRoot) return;
+    event.preventDefault();
+    const row = event.target instanceof Element ? event.target.closest<HTMLElement>(".tree-row") : null;
+    const target = row?.dataset.path ? findTreeNode(workspaceRoot, row.dataset.path) : null;
+    openExplorerContextMenu(event.clientX, event.clientY, target);
+  });
+  dom.explorerContextMenu.querySelectorAll<HTMLButtonElement>("[data-ecxt]").forEach((item) => {
+    item.addEventListener("click", () => {
+      const kind = item.dataset.ecxt;
+      const target = explorerMenuTarget;
+      const directoryTarget = target
+        ? target.isDirectory
+          ? target
+          : ((workspaceRoot ? findParentNode(workspaceRoot, target.path) : null) ?? workspaceRoot)
+        : workspaceRoot;
+      closeMenus();
+      if (kind === "new-file" && directoryTarget) void createExplorerEntry(directoryTarget, "file");
+      else if (kind === "new-folder" && directoryTarget) void createExplorerEntry(directoryTarget, "folder");
+      else if (kind === "rename" && target) void renameExplorerNode(target);
+      else if (kind === "delete" && target) void deleteExplorerNode(target);
+    });
   });
   dom.editorContextMenu.querySelectorAll<HTMLButtonElement>("[data-ctx]").forEach((item) => {
     item.addEventListener("click", () => {
@@ -2175,6 +2608,7 @@ function registerActions(): void {
     folderSearchGeneration += 1;
     dom.searchQuery.value = "";
     fileMatches = [];
+    lastFolderMatches = [];
     dom.folderResults.replaceChildren();
     dom.folderResults.hidden = searchScope === "file";
     setSearchCount("Saisissez un terme");
@@ -2208,6 +2642,21 @@ function registerActions(): void {
     }
   });
 
+  dom.promptInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      // La touche Entrée doit valider, pas déclencher le premier bouton
+      // (Annuler) de la soumission implicite du formulaire.
+      event.preventDefault();
+      dom.promptDialog.returnValue = "confirm";
+      dom.promptDialog.close();
+    }
+  });
+
+  dom.compareDialog.addEventListener("close", () => {
+    if (dom.compareDialog.returnValue === "confirm") openComparison();
+  });
+  element<HTMLButtonElement>("#diff-close").addEventListener("click", closeComparison);
+
   dom.languageSelect.addEventListener("change", () => {
     const current = activeDocument();
     if (!current) return;
@@ -2225,20 +2674,26 @@ function registerActions(): void {
   element<HTMLButtonElement>("#window-close").addEventListener("click", () => void requestWindowClose());
 
   window.addEventListener("keydown", (event) => {
-    // Le dialogue modal de confirmation est prioritaire : ignorer tout
-    // raccourci pendant son affichage (un second showModal() lèverait une
-    // InvalidStateError, et des documents peuvent être fermés en arrière-plan).
-    if (dom.confirmDialog.open) return;
+    // Un dialogue modal (confirmation, saisie, comparaison) est prioritaire :
+    // ignorer tout raccourci pendant son affichage (un second showModal()
+    // lèverait une InvalidStateError).
+    if (dom.confirmDialog.open || dom.promptDialog.open || dom.compareDialog.open) return;
     const control = event.ctrlKey || event.metaKey;
     if (!control) {
-      if (event.key === "Escape" && !dom.searchPanel.hidden) closeSearchPanel();
-      else if (event.key === "Escape") closeMenus();
+      if (event.key === "Escape") {
+        if (diffEditor) {
+          closeComparison();
+          return;
+        }
+        if (!dom.searchPanel.hidden) closeSearchPanel();
+        else closeMenus();
+      }
       return;
     }
     const key = event.key.toLocaleLowerCase();
     const handled =
       key === "n" || key === "o" || key === "k" || key === "s" || key === "f" ||
-      key === "h" || key === "w" || (key === "v" && event.shiftKey);
+      key === "h" || key === "d" || key === "w" || (key === "v" && event.shiftKey);
     if (!handled) return;
     event.preventDefault();
     event.stopPropagation();
@@ -2256,6 +2711,8 @@ function registerActions(): void {
       openSearchPanel();
     } else if (key === "h") {
       openReplacePanel();
+    } else if (key === "d") {
+      openCompareDialog();
     } else if (key === "v" && event.shiftKey) {
       setPreviewVisible(!previewVisible);
       if (previewVisible) void refreshPreview(false);
@@ -2264,6 +2721,30 @@ function registerActions(): void {
       if (current) void closeDocument(current.id);
     }
   }, true);
+
+  window.addEventListener(
+    "wheel",
+    (event) => {
+      if (!(event.ctrlKey || event.metaKey) || !isNativeApp) return;
+      event.preventDefault();
+      interfaceZoom = Math.round(
+        Math.min(2.5, Math.max(0.5, interfaceZoom + (event.deltaY < 0 ? 0.1 : -0.1))) * 10,
+      ) / 10;
+      void getCurrentWebview()
+        .setZoom(interfaceZoom)
+        .catch(() => {
+          // Zoom indisponible sur cette plateforme : silencieux.
+        });
+    },
+    { passive: false },
+  );
+
+  if (appWindow) {
+    void appWindow.onDragDropEvent((event) => {
+      if (event.payload.type !== "drop") return;
+      void handleDroppedPaths(event.payload.paths);
+    });
+  }
 
   codeEditor.onDidChangeCursorPosition(renderStatus);
   codeEditor.onDidChangeModel(() => {
@@ -2286,5 +2767,6 @@ applyTheme(activeTheme, false);
 setupResizers();
 setupSearchPanelDrag();
 registerActions();
+dom.autosaveToggle.setAttribute("aria-checked", String(autosaveEnabled));
 refreshChrome();
 void initializeSession();
