@@ -48,6 +48,12 @@ export interface OpenDocument {
   model: monaco.editor.ITextModel;
   dirty: boolean;
   suppressDirty: boolean;
+  /**
+   * Le fichier a changé sur le disque depuis son ouverture et l'écart n'est
+   * pas encore résolu : l'enregistrement automatique est suspendu jusqu'à ce
+   * que l'utilisateur écrase ou recharge.
+   */
+  externalConflict: boolean;
   /** Date de modification du fichier sur disque (ms) telle que lue à l'ouverture. */
   modified: number;
   disposeChangeListener: monaco.IDisposable;

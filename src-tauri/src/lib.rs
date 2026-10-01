@@ -10,6 +10,7 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use tauri::http::{header, Request, Response, StatusCode};
+use tauri::{Emitter, Manager};
 
 const MAX_SEARCH_MATCHES: usize = 500;
 const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -85,12 +86,20 @@ fn is_supported_file_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[tauri::command]
-fn get_launch_files() -> Vec<String> {
-    std::env::args_os()
+// Extrait les chemins de fichiers pris en charge d'une ligne de commande.
+// Le premier élément (l'exécutable) est ignoré : que ce soit au premier
+// lancement (env::args_os) ou dans le rappel d'instance unique (argv du
+// second processus), la structure est la même.
+fn collect_launch_files<I>(arguments: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: Into<std::ffi::OsString>,
+{
+    arguments
+        .into_iter()
         .skip(1)
         .filter_map(|argument| {
-            let path = PathBuf::from(argument);
+            let path = PathBuf::from(argument.into());
             if !path.is_file() || !is_supported_file_path(&path) {
                 return None;
             }
@@ -102,6 +111,11 @@ fn get_launch_files() -> Vec<String> {
             )
         })
         .collect()
+}
+
+#[tauri::command]
+fn get_launch_files() -> Vec<String> {
+    collect_launch_files(std::env::args_os())
 }
 
 fn modified_millis(path: &Path) -> u64 {
@@ -659,6 +673,18 @@ pub fn run() {
     let protocol_state = preview_state.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, arguments, _cwd| {
+            // Second lancement : transmettre les fichiers à la fenêtre
+            // existante plutôt que d'ouvrir un nouveau processus.
+            let files = collect_launch_files(arguments);
+            if files.is_empty() {
+                return;
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("launch-files", files);
+                let _ = window.set_focus();
+            }
+        }))
         .manage(preview_state)
         .register_uri_scheme_protocol("codenotepad", move |_context, request| {
             serve_preview(&protocol_state, request)
@@ -718,6 +744,28 @@ mod tests {
         assert!(is_supported_file_path(Path::new("page.html")));
         assert!(!is_supported_file_path(Path::new("archive.zip")));
         assert!(!is_supported_file_path(Path::new("program.exe")));
+    }
+
+    #[test]
+    fn collect_launch_files_keeps_supported_files_and_skips_the_executable() {
+        let root = test_directory();
+        let text = root.join("note.md");
+        let binary = root.join("binaire.exe");
+        fs::write(&text, "contenu").expect("fixture should be written");
+        fs::write(&binary, "MZ").expect("fixture should be written");
+
+        let arguments = vec![
+            std::ffi::OsString::from("code-notepad.exe"),
+            text.clone().into_os_string(),
+            binary.into_os_string(),
+            root.clone().into_os_string(),
+            std::ffi::OsString::from("chemin-inexistant.txt"),
+        ];
+
+        let files = collect_launch_files(arguments);
+        assert_eq!(files.len(), 1, "seul le fichier texte doit être retenu");
+        assert!(files[0].ends_with("note.md"));
+        fs::remove_dir_all(root).expect("test directory should be removed");
     }
 
     #[test]

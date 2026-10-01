@@ -273,6 +273,7 @@
         </div>
         <div class="dialog-actions">
           <button id="confirm-cancel" class="button-secondary" value="cancel">Annuler</button>
+          <button id="confirm-reload" class="button-secondary" value="reload" hidden>Recharger le fichier</button>
           <button id="confirm-accept" class="button-danger" value="confirm">Fermer sans enregistrer</button>
         </div>
       </form>
@@ -299,6 +300,15 @@
       <span class="menu-separator" role="separator"></span>
       <button role="menuitem" data-ecxt="rename"><span>Renommer…</span></button>
       <button role="menuitem" data-ecxt="delete"><span>Supprimer</span></button>
+    </div>
+
+    <div id="tabs-context-menu" class="menu-popover editor-context-menu" role="menu" aria-label="Menu contextuel des onglets" hidden>
+      <button role="menuitem" data-tcxt="save"><span>Enregistrer</span></button>
+      <button role="menuitem" data-tcxt="save-all"><span>Tout enregistrer</span></button>
+      <span class="menu-separator" role="separator"></span>
+      <button role="menuitem" data-tcxt="close"><span>Fermer</span></button>
+      <button role="menuitem" data-tcxt="close-others"><span>Fermer les autres</span></button>
+      <button role="menuitem" data-tcxt="close-all"><span>Tout fermer</span></button>
     </div>
 
     <dialog id="prompt-dialog" class="confirm-dialog" aria-labelledby="prompt-title">

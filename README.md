@@ -8,7 +8,8 @@
 - onglets de session fermables, avec protection des modifications non enregistrées ;
 - enregistrement atomique avec détection des modifications externes : un fichier changé par une autre application ne peut être écrasé qu’après confirmation ;
 - enregistrement automatique optionnel (1,5 s après la dernière frappe) et tampons anti-crash : les modifications non enregistrées sont récupérées au démarrage suivant ;
-- session réouvrable au lancement et restaurée automatiquement après un rechargement de la page ;
+- session précédente restaurée automatiquement au lancement (fichiers rouverts sans dialogue, dossier de projet omis) et intégralement après un rechargement de la page ;
+- instance unique : un fichier ouvert depuis l'Explorateur Windows arrive dans la fenêtre déjà active, accompagné de la session précédente ;
 - menu contextuel de l’explorateur : nouveau fichier, nouveau dossier, renommage et suppression vers la corbeille ;
 - comparaison côte à côte de deux fichiers ouverts (diff Monaco, Ctrl+D) ;
 - remplacement multi-fichiers depuis la recherche « Dossier », avec confirmation et récapitulatif ;

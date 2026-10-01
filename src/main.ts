@@ -5,6 +5,7 @@ import "@fontsource/ibm-plex-sans/latin-600.css";
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "@fontsource/jetbrains-mono/latin-600.css";
 
+import { listen } from "@tauri-apps/api/event";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -143,9 +144,11 @@ const dom = {
   confirmTitle: element<HTMLElement>("#confirm-title"),
   confirmDescription: element<HTMLElement>("#confirm-description"),
   confirmCancel: element<HTMLButtonElement>("#confirm-cancel"),
+  confirmReload: element<HTMLButtonElement>("#confirm-reload"),
   confirmAccept: element<HTMLButtonElement>("#confirm-accept"),
   editorContextMenu: element<HTMLElement>("#editor-context-menu"),
   explorerContextMenu: element<HTMLElement>("#explorer-context-menu"),
+  tabsContextMenu: element<HTMLElement>("#tabs-context-menu"),
   promptDialog: element<HTMLDialogElement>("#prompt-dialog"),
   promptTitle: element<HTMLElement>("#prompt-title"),
   promptLabel: element<HTMLElement>("#prompt-label"),
@@ -346,6 +349,7 @@ let lastFolderMatches: DirectorySearchMatch[] = [];
 let diffEditor: monaco.editor.IStandaloneDiffEditor | null = null;
 let diffModels: { original: monaco.editor.ITextModel; modified: monaco.editor.ITextModel } | null = null;
 let explorerMenuTarget: TreeNode | null = null;
+let tabsMenuTargetId: string | null = null;
 let projectSourceLibraries: monaco.IDisposable[] = [];
 let projectContextGeneration = 0;
 const autosaveTimers = new Map<string, number>();
@@ -549,12 +553,46 @@ async function confirmAction(title: string, description: string, acceptLabel: st
   dom.confirmTitle.textContent = title;
   dom.confirmDescription.textContent = description;
   dom.confirmAccept.textContent = acceptLabel;
+  dom.confirmReload.hidden = true;
   dom.confirmDialog.showModal();
+  // showModal ne réinitialise pas returnValue : sans cette remise à zéro, une
+  // fermeture par Échap hériterait du choix du dialogue précédent.
+  dom.confirmDialog.returnValue = "";
   window.setTimeout(() => dom.confirmCancel.focus(), 0);
   return new Promise((resolve) => {
     dom.confirmDialog.addEventListener(
       "close",
       () => resolve(dom.confirmDialog.returnValue === "confirm"),
+      { once: true },
+    );
+  });
+}
+
+type ExternalChangeChoice = "overwrite" | "reload" | "cancel";
+
+function confirmExternalModification(documentRecord: OpenDocument): Promise<ExternalChangeChoice> {
+  // Même garde de réentrance que confirmAction.
+  if (dom.confirmDialog.open) return Promise.resolve("cancel");
+  const reloadWarning = documentRecord.dirty
+    ? " Vos modifications non enregistrées seront perdues."
+    : "";
+  dom.confirmTitle.textContent = "Fichier modifié en dehors de l’application";
+  dom.confirmDescription.textContent =
+    `« ${documentRecord.name} » a été modifié par une autre application depuis son ouverture. ` +
+    "Écraser : remplace la version du disque par le contenu affiché. " +
+    `Recharger : abandonne le contenu affiché et charge la version du disque.${reloadWarning}`;
+  dom.confirmAccept.textContent = "Écraser le fichier";
+  dom.confirmReload.hidden = false;
+  dom.confirmDialog.showModal();
+  dom.confirmDialog.returnValue = "";
+  window.setTimeout(() => dom.confirmCancel.focus(), 0);
+  return new Promise((resolve) => {
+    dom.confirmDialog.addEventListener(
+      "close",
+      () => {
+        const value = dom.confirmDialog.returnValue;
+        resolve(value === "confirm" ? "overwrite" : value === "reload" ? "reload" : "cancel");
+      },
       { once: true },
     );
   });
@@ -613,7 +651,9 @@ function scheduleBufferSave(documentRecord: OpenDocument): void {
 }
 
 function scheduleAutosave(documentRecord: OpenDocument): void {
-  if (!autosaveEnabled || !documentRecord.path) return;
+  // Conflit externe non résolu : ne pas réécrire par-dessus la version du
+  // disque en boucle — l'utilisateur tranche via Enregistrer (écraser/recharger).
+  if (!autosaveEnabled || !documentRecord.path || documentRecord.externalConflict) return;
   window.clearTimeout(autosaveTimers.get(documentRecord.id));
   autosaveTimers.set(
     documentRecord.id,
@@ -675,6 +715,7 @@ function createDocument(
     model,
     dirty: false,
     suppressDirty: false,
+    externalConflict: false,
     modified,
     disposeChangeListener: noopDisposable,
   };
@@ -717,6 +758,7 @@ function renderTabs(): void {
   for (const documentRecord of documents) {
     const wrapper = document.createElement("div");
     wrapper.className = `tab${documentRecord.id === activeDocumentId ? " is-active" : ""}`;
+    wrapper.dataset.documentId = documentRecord.id;
 
     const selectButton = document.createElement("button");
     selectButton.type = "button";
@@ -897,10 +939,12 @@ async function restoreFromSnapshot(snapshot: SessionSnapshotData, silent: boolea
     ? documents.find((document) => document.path && pathEquals(document.path, activePath))
     : undefined;
   if (activeDoc) switchDocument(activeDoc.id);
-  if (!silent && (restored > 0 || workspaceRoot)) {
+  if (!silent && restored > 0) {
     showToast(
       "Session restaurée",
-      `${restored} fichier${restored > 1 ? "s" : ""} et le dossier ont été rouverts.`,
+      snapshot.workspace
+        ? `${restored} fichier${restored > 1 ? "s" : ""} et le dossier ont été rouverts.`
+        : `${restored} fichier${restored > 1 ? "s" : ""} de la session précédente ont été rouverts.`,
       "info",
     );
   }
@@ -954,17 +998,15 @@ async function restoreSessionAfterReload(): Promise<void> {
     snapshot = null;
   }
   if (snapshot?.paths?.length || snapshot?.workspace) {
-    // Rechargement de la page (Vite, crash webview) : restauration silencieuse.
+    // Rechargement de la page (Vite, crash webview) : restauration silencieuse
+    // complète, dossier compris.
     await restoreFromSnapshot(snapshot, true);
   } else {
+    // Lancement : les fichiers de la session précédente sont rouverts
+    // automatiquement, sans dialogue ni dossier de projet.
     const last = readLastSession();
-    if (last && (last.paths.length > 0 || last.workspace)) {
-      const confirmed = await confirmAction(
-        "Réouvrir la dernière session ?",
-        `${last.paths.length} fichier${last.paths.length > 1 ? "s" : ""}${last.workspace ? ` et le dossier « ${fileNameFromPath(last.workspace)} »` : ""} seront rouverts.`,
-        "Réouvrir la session",
-      );
-      if (confirmed) await restoreFromSnapshot(last, false);
+    if (last && last.paths.length > 0) {
+      await restoreFromSnapshot({ workspace: null, paths: last.paths, activePath: last.activePath }, false);
     }
   }
   await recoverUnsavedBuffers();
@@ -972,13 +1014,20 @@ async function restoreSessionAfterReload(): Promise<void> {
   saveSessionSnapshot();
 }
 
+async function handleLaunchFiles(paths: string[]): Promise<void> {
+  for (const path of paths) {
+    await openFilePath(normalizeDialogPath(path));
+  }
+  void appWindow?.setFocus().catch(() => {
+    // Focus indisponible : l'ouverture des fichiers reste le comportement clé.
+  });
+}
+
 async function openFilesFromWindows(): Promise<void> {
   if (!isNativeApp) return;
   try {
     const paths = await invoke<string[]>("get_launch_files");
-    for (const path of paths) {
-      await openFilePath(normalizeDialogPath(path));
-    }
+    await handleLaunchFiles(paths);
   } catch (error) {
     showToast("Ouverture Windows impossible", errorMessage(error), "error");
   }
@@ -1070,6 +1119,35 @@ function scheduleProjectContextRefresh(path: string): void {
   }, 1500);
 }
 
+// Recharge le contenu du disque dans l'éditeur : via pushEditOperations plutôt
+// que setValue pour que l'annulation (Ctrl+Z) rende accessible la version
+// écartée de l'utilisateur.
+async function reloadDocument(documentRecord: OpenDocument): Promise<void> {
+  if (!documentRecord.path) return;
+  try {
+    const content = await invoke<FileContent>("read_file", { path: documentRecord.path });
+    const model = documentRecord.model;
+    const viewState = documentRecord.id === activeDocumentId ? codeEditor.saveViewState() : null;
+    documentRecord.suppressDirty = true;
+    model.pushEditOperations(
+      [],
+      [{ range: model.getFullModelRange(), text: content.contents }],
+      () => null,
+    );
+    documentRecord.suppressDirty = false;
+    documentRecord.modified = content.modified;
+    documentRecord.dirty = false;
+    documentRecord.externalConflict = false;
+    clearDocumentTracking(documentRecord);
+    if (viewState) codeEditor.restoreViewState(viewState);
+    refreshChrome();
+    showToast("Fichier rechargé", `${documentRecord.name} : la version du disque a été chargée.`, "success");
+  } catch (error) {
+    renderStatus();
+    showToast("Rechargement impossible", `${documentRecord.name} : ${errorMessage(error)}`, "error");
+  }
+}
+
 async function persistDocument(
   documentRecord: OpenDocument,
   target: string,
@@ -1091,6 +1169,7 @@ async function persistDocument(
     monaco.editor.setModelLanguage(documentRecord.model, documentRecord.language);
     documentRecord.modified = modified;
     documentRecord.dirty = false;
+    documentRecord.externalConflict = false;
     clearBuffer(previousBufferKey);
     clearBuffer(documentBufferKey(documentRecord));
     recents = rememberRecent("file", target, documentRecord.name);
@@ -1101,12 +1180,27 @@ async function persistDocument(
   } catch (error) {
     const message = errorMessage(error);
     if (message.startsWith(MODIFIED_EXTERNALLY_PREFIX)) {
-      const overwrite = await confirmAction(
-        "Fichier modifié en dehors de l’application",
-        `« ${documentRecord.name} » a été modifié par une autre application depuis son ouverture. Enregistrer remplacera cette version externe.`,
-        "Écraser le fichier",
-      );
-      if (overwrite) return persistDocument(documentRecord, target, 0, silent);
+      // L'autosave ne doit jamais interrompre la frappe avec une modale : il
+      // suspend l'enregistrement du document et signale une seule fois.
+      if (silent) {
+        const wasNew = !documentRecord.externalConflict;
+        documentRecord.externalConflict = true;
+        renderStatus();
+        if (wasNew) {
+          showToast(
+            "Fichier modifié en dehors de l’application",
+            `« ${documentRecord.name} » a changé sur le disque. Enregistrement automatique suspendu : utilisez Enregistrer pour choisir entre écraser et recharger.`,
+            "error",
+          );
+        }
+        return false;
+      }
+      const choice = await confirmExternalModification(documentRecord);
+      if (choice === "reload") {
+        await reloadDocument(documentRecord);
+        return false;
+      }
+      if (choice === "overwrite") return persistDocument(documentRecord, target, 0, silent);
       renderStatus();
       return false;
     }
@@ -1183,6 +1277,29 @@ async function closeDocument(id: string, skipConfirmation = false): Promise<bool
   refreshChrome();
   if (previewVisible) await refreshPreview(false);
   return true;
+}
+
+// Actions groupées du menu contextuel des onglets : chaque étape passe par
+// closeDocument / saveDocument (confirmations incluses) ; un refus de
+// l'utilisateur interrompt le reste du lot.
+async function saveAllDocuments(): Promise<void> {
+  for (const documentRecord of [...documents]) {
+    if (!documentRecord.dirty) continue;
+    if (!(await saveDocument(documentRecord))) return;
+  }
+}
+
+async function closeOtherDocuments(keepId: string): Promise<void> {
+  for (const documentRecord of [...documents]) {
+    if (documentRecord.id === keepId) continue;
+    if (!(await closeDocument(documentRecord.id))) return;
+  }
+}
+
+async function closeAllDocuments(): Promise<void> {
+  for (const documentRecord of [...documents]) {
+    if (!(await closeDocument(documentRecord.id))) return;
+  }
 }
 
 async function openFolder(): Promise<void> {
@@ -1420,6 +1537,7 @@ function closeMenus(): void {
   dom.recentMenu.hidden = true;
   dom.editorContextMenu.hidden = true;
   dom.explorerContextMenu.hidden = true;
+  dom.tabsContextMenu.hidden = true;
   dom.fileMenuTrigger.setAttribute("aria-expanded", "false");
   dom.editMenuTrigger.setAttribute("aria-expanded", "false");
   dom.recentTrigger.setAttribute("aria-expanded", "false");
@@ -1938,6 +2056,24 @@ function openEditorContextMenu(x: number, y: number): void {
   dom.editorContextMenu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - width - 8))}px`;
   dom.editorContextMenu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - height - 8))}px`;
   dom.editorContextMenu.querySelector<HTMLButtonElement>("button:not([disabled])")?.focus();
+}
+
+function openTabsContextMenu(x: number, y: number, documentId: string): void {
+  closeMenus();
+  tabsMenuTargetId = documentId;
+  const setDisabled = (kind: string, disabled: boolean): void => {
+    const button = dom.tabsContextMenu.querySelector<HTMLButtonElement>(`[data-tcxt="${kind}"]`);
+    if (button) button.disabled = disabled;
+  };
+  setDisabled("save-all", !documents.some((documentRecord) => documentRecord.dirty));
+  setDisabled("close-others", documents.length <= 1);
+  setDisabled("close-all", documents.length === 0);
+  dom.tabsContextMenu.hidden = false;
+  const width = dom.tabsContextMenu.offsetWidth;
+  const height = dom.tabsContextMenu.offsetHeight;
+  dom.tabsContextMenu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - width - 8))}px`;
+  dom.tabsContextMenu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - height - 8))}px`;
+  dom.tabsContextMenu.querySelector<HTMLButtonElement>("button:not([disabled])")?.focus();
 }
 
 async function renameActiveDocument(): Promise<void> {
@@ -2540,7 +2676,8 @@ function registerActions(): void {
     if (target instanceof Node && !dom.fileMenu.contains(target) && !dom.fileMenuTrigger.contains(target) &&
       !dom.editMenu.contains(target) && !dom.editMenuTrigger.contains(target) &&
       !dom.recentMenu.contains(target) && !dom.recentTrigger.contains(target) &&
-      !dom.editorContextMenu.contains(target) && !dom.explorerContextMenu.contains(target)) {
+      !dom.editorContextMenu.contains(target) && !dom.explorerContextMenu.contains(target) &&
+      !dom.tabsContextMenu.contains(target)) {
       closeMenus();
     }
   });
@@ -2548,6 +2685,16 @@ function registerActions(): void {
   dom.editor.addEventListener("contextmenu", (event) => {
     event.preventDefault();
     openEditorContextMenu(event.clientX, event.clientY);
+  });
+
+  // Clic droit sur la barre d'onglets : menu maison au lieu du menu WebView2.
+  // Sur le fond de la barre (aucun onglet visé), le menu par défaut est simplement
+  // supprimé.
+  dom.tabs.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    const wrapper = event.target instanceof Element ? event.target.closest<HTMLElement>(".tab") : null;
+    const documentId = wrapper?.dataset.documentId;
+    if (documentId) openTabsContextMenu(event.clientX, event.clientY, documentId);
   });
 
   dom.explorerContent.addEventListener("contextmenu", (event) => {
@@ -2587,6 +2734,18 @@ function registerActions(): void {
         case "occurrences": runEditorCommand("editor.action.changeAll"); break;
         case "select-all": selectAllInEditor(); break;
       }
+    });
+  });
+  dom.tabsContextMenu.querySelectorAll<HTMLButtonElement>("[data-tcxt]").forEach((item) => {
+    item.addEventListener("click", () => {
+      const kind = item.dataset.tcxt;
+      const target = tabsMenuTargetId ? documents.find((documentRecord) => documentRecord.id === tabsMenuTargetId) ?? null : null;
+      closeMenus();
+      if (kind === "save" && target) void saveDocument(target);
+      else if (kind === "save-all") void saveAllDocuments();
+      else if (kind === "close" && target) void closeDocument(target.id);
+      else if (kind === "close-others" && target) void closeOtherDocuments(target.id);
+      else if (kind === "close-all") void closeAllDocuments();
     });
   });
 
@@ -2743,6 +2902,11 @@ function registerActions(): void {
     void appWindow.onDragDropEvent((event) => {
       if (event.payload.type !== "drop") return;
       void handleDroppedPaths(event.payload.paths);
+    });
+    // Une seconde exécution de l'application (double-clic, « Ouvrir avec »)
+    // transmet ses fichiers à cette fenêtre au lieu d'en ouvrir une nouvelle.
+    void listen<string[]>("launch-files", (event) => {
+      void handleLaunchFiles(event.payload);
     });
   }
 
