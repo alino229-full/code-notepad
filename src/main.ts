@@ -2934,3 +2934,51 @@ registerActions();
 dom.autosaveToggle.setAttribute("aria-checked", String(autosaveEnabled));
 refreshChrome();
 void initializeSession();
+
+/**
+ * Mode pilotage : le serveur MCP (dossier mcp/) lance l'application avec CODE_NOTEPAD_AUTOMATION et se
+ * connecte à WebView2 par le débogage à distance. Cette interface n'existe que dans ce mode : sans
+ * lui, rien n'est exposé à la page.
+ */
+async function exposeAutomationApi(): Promise<void> {
+  if (!isNativeApp) return;
+  try {
+    if (!(await invoke<boolean>("automation_enabled"))) return;
+  } catch {
+    return;
+  }
+  const state = () => {
+    const current = activeDocument();
+    const position = codeEditor.getPosition();
+    return {
+      workspace: workspaceRoot?.path ?? null,
+      active: current ? { name: current.name, path: current.path, language: current.language, dirty: current.dirty } : null,
+      tabs: documents.map((d) => ({ id: d.id, name: d.name, path: d.path, dirty: d.dirty })),
+      cursor: position ? { line: position.lineNumber, column: position.column } : null,
+      previewVisible,
+      theme: activeTheme,
+    };
+  };
+  const api = {
+    monaco,
+    editor: codeEditor,
+    state,
+    openFile: (path: string, line?: number) => openFilePath(path, line),
+    openFolder: (path: string) => openFolderPath(path, true),
+    newFile,
+    save: () => saveDocument(),
+    closeActive: () => {
+      const current = activeDocument();
+      return current ? closeDocument(current.id, true) : Promise.resolve(true);
+    },
+    setPreview: async (visible: boolean) => {
+      setPreviewVisible(visible);
+      if (visible) await refreshPreview(true);
+    },
+    refreshPreview: () => refreshPreview(true),
+    setTheme: (theme: Theme) => applyTheme(theme, false),
+  };
+  (window as unknown as { __notepad: typeof api }).__notepad = api;
+}
+
+void exposeAutomationApi();

@@ -1,0 +1,13 @@
+{
+  "name": "code-notepad-mcp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Serveur MCP : pilote Code Notepad sans fenêtre visible (WebView2 en débogage à distance)",
+  "scripts": { "start": "node server.mjs", "test": "node --test" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "puppeteer-core": "^24.0.0",
+    "zod": "^3.25.0"
+  }
+}

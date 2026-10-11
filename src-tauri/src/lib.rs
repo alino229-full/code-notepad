@@ -113,6 +113,17 @@ where
         .collect()
 }
 
+/// Mode pilotage (serveur MCP) : `CODE_NOTEPAD_AUTOMATION` défini au lancement. L'instance est alors
+/// indépendante (pas d'instance unique) et sa fenêtre reste hors de l'écran, sans barre des tâches.
+fn automation_requested() -> bool {
+    std::env::var_os("CODE_NOTEPAD_AUTOMATION").is_some()
+}
+
+#[tauri::command]
+fn automation_enabled() -> bool {
+    automation_requested()
+}
+
 #[tauri::command]
 fn get_launch_files() -> Vec<String> {
     collect_launch_files(std::env::args_os())
@@ -672,8 +683,10 @@ pub fn run() {
     let preview_state = PreviewState::default();
     let protocol_state = preview_state.clone();
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, arguments, _cwd| {
+    let automation = automation_requested();
+    let mut builder = tauri::Builder::default();
+    if !automation {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, arguments, _cwd| {
             // Second lancement : transmettre les fichiers à la fenêtre
             // existante plutôt que d'ouvrir un nouveau processus.
             let files = collect_launch_files(arguments);
@@ -684,7 +697,9 @@ pub fn run() {
                 let _ = window.emit("launch-files", files);
                 let _ = window.set_focus();
             }
-        }))
+        }));
+    }
+    builder
         .manage(preview_state)
         .register_uri_scheme_protocol("codenotepad", move |_context, request| {
             serve_preview(&protocol_state, request)
@@ -694,6 +709,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             read_file,
+            automation_enabled,
             get_launch_files,
             write_file,
             rename_file,
@@ -706,6 +722,15 @@ pub fn run() {
             clear_preview,
             search_directory
         ])
+        .setup(move |app| {
+            if automation {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_skip_taskbar(true);
+                    let _ = window.set_position(tauri::PhysicalPosition::new(-32000, -32000));
+                }
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
